@@ -1,441 +1,485 @@
-# FASTQ → BAM for nexons
+# FASTQ → BAM for nexons — step by step
 
 Turning Oxford Nanopore cDNA reads into the coordinate-sorted, indexed BAM that
-`nexons.py` expects. Everything here runs inside the sandbox pixi environment.
+`nexons.py` expects, on mouse GRCm39.
 
-The pipeline is one script, [`fastq_to_bam.sh`](fastq_to_bam.sh); this file
-explains what it does, what to set before running it, and how long to expect it
-to take on a 16-core / 8 GB laptop.
+Follow the **RECOMMENDED** steps in order. Each one ends in something you can
+check, so a failure is caught at the step that caused it rather than an hour
+later. Every parameter of the alignment command itself is explained separately
+in [`COMMAND_EXPLAINED.md`](COMMAND_EXPLAINED.md).
 
-## Or run it as a notebook
+## What you end up with
 
-[`fastq_to_bam_examples.ipynb`](fastq_to_bam_examples.ipynb) walks the same
-pipeline stage by stage, with the preflight checks, the read-length and
-alignment-QC plots, and a throughput measurement that extrapolates to your full
-run. Open it with the **Python (nexons pixi)** kernel:
-
-```bash
-cd sandbox
-pixi install                      # once
-pixi run jupyter lab fastq_to_bam/fastq_to_bam_examples.ipynb
+```
+sandbox/big_data/
+├── input/                  ← your FASTQ reads go here
+│   ├── PBM75668_pass_L001_barcode01.fastq.gz
+│   └── PBM75668_pass_L001_barcode02.fastq.gz
+├── reference/              ← genome, annotation, minimap2 index
+│   ├── Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+│   ├── Mus_musculus.GRCm39.116.gtf.gz
+│   └── Mus_musculus_GRCm39_2026_04.mmi
+├── outputs/                ← BAMs land here
+│   ├── PBM75668_pass_L001_barcode01.bam
+│   └── PBM75668_pass_L001_barcode01.bam.bai
+└── tmp/                    ← samtools sort scratch
 ```
 
-It is cheap by default — a 50,000-read subsample, about a minute end to end —
-and every long stage is gated behind an explicit flag, so nothing starts a
-multi-hour job unless you ask. It also degrades rather than failing if
-`minimap2` is not installed yet, so it is safe to run before `pixi install`
-finishes.
-
-The notebook is a **build product** of
-[`build_fastq_notebook.py`](build_fastq_notebook.py) — prose and code stay in
-one reviewable diff, and a notebook broken by a bad merge can be regenerated:
-
-```bash
-pixi run python fastq_to_bam/build_fastq_notebook.py
-```
-
-Edit the builder, not the `.ipynb`. And **clear the outputs before committing**
-(`Kernel → Restart Kernel and Clear All Outputs`) — executed cells store their
-output inside the file.
+Nothing under `big_data/` is version-controlled — it is excluded by
+`sandbox/.gitignore`, which is deliberate: a single barcode here is ~9 GB.
 
 ---
 
-## The dataset this was written against
+## Step 0 (RECOMMENDED) — check it will fit before downloading anything
 
-This is a **multiplexed run** — `barcode01` and `barcode02` were both present
-in `big_data`, so budget per barcode and multiply by however many arrive.
-
-Measured across the whole of `barcode01` (8.9 GiB, download complete):
-
-| Property | Value |
-|---|---|
-| Reads | 3,442,720 |
-| Total sequence | 4.17 Gbase |
-| Mean read length | 1,211 bp |
-| Read length range | 13 – 10,460 bp |
-| Record size on disk (uncompressed) | ~2,600 bytes/read |
-| Yield per GiB of uncompressed FASTQ | ~387,000 reads ≈ 469 Mbase |
-| Basecall model (from the `RG` tag) | `dna_r10.4.1_e8.2_400bps_hac@v5.2.0` |
-| Library | `SMART-Seq`, one file per barcode |
-
-Two consequences worth knowing before you pick flags:
-
-- **This is cDNA, not direct RNA.** The `dna_` model prefix and the SMART-Seq
-  kit both say so. cDNA reads come off both strands, so the aligner must look
-  for `GT..AG` on either strand. `-x splice` already sets `-ub` (both strands),
-  which is what you want. Do **not** add `-uf` — that is the direct-RNA setting
-  and it will lose roughly half your junctions here.
-- **The library is unstranded**, so nexons should run with `--direction none`
-  (its default). Incidentally, that option's help text advertises `opposing`
-  while the code tests for `opposite`; passing `opposing` raises. Not a problem
-  for this library, but worth knowing.
-
-### Two things about the file as downloaded
-
-**It is not gzipped**, despite the `.fastq.gz` name — the first bytes are plain
-ASCII `@<uuid>`, and `gzip -t` rejects it. Every tool here reads it fine
-(minimap2 sniffs the magic bytes rather than trusting the extension), but it is
-costing you about 3× the disk it needs to. Once the transfer is finished:
+**Do this first.** minimap2 holds the entire index in RAM for the whole run. If
+it does not fit, the kernel kills the process with no message beyond `Killed`,
+after you have already spent an hour on the download and the index build.
 
 ```bash
-cd sandbox/big_data
-# One file per barcode; give each an honest name, then compress in parallel.
-# The run prefix is taken from the filename, so nothing is hardcoded.
-for f in *_pass_L001_barcode*.fastq.gz; do
-    bc=${f#*_barcode}; bc=barcode${bc%%.*}     # e.g. barcode01
-    mv "$f" "${f%%_*}_${bc}.fastq"             # e.g. RUNID_barcode01.fastq
-done
-pixi run pigz -p 8 *_barcode*.fastq            # → .fastq.gz, ~3x smaller
+free -g              # total and available RAM
+nproc                # cores
+df -h .              # free disk on the data volume
 ```
 
-Compressing is optional — minimap2 reads either — but at ~9 GiB per barcode it
-pays for itself quickly on a multiplexed run.
+This machine reports **~7.6 GiB total, ~5 GiB available, 16 cores**.
 
-**The download was still running** when this was written: `barcode01` had
-finished at 8.9 GiB, `barcode02` was still arriving at roughly 9–11 MiB/s, and
-both still carried the `.part` suffix that the transfer tool strips on
-completion. `fastq_to_bam.sh` refuses to start while any `.part` file is
-present in the input directory, because minimap2 will align a truncated FASTQ
-without complaining and exit 0, and you will not notice until the counts look
-wrong.
+The arithmetic for a whole-genome mouse splice index:
 
-That guard is deliberately blunt — it blocks on *any* partial file, not just
-the one you asked for. If you want to start aligning finished barcodes while
-the rest download, move them into a separate directory and point `FASTQ_DIR`
-at that.
+| Quantity | Value | Where it comes from |
+|---|---|---|
+| Genome size | ~2.7 Gbase | GRCm39 primary assembly |
+| Minimizer window (`-x splice`) | `w=5` | Denser than the `w=10` of genomic presets |
+| Minimizers stored | ~900 M | ≈ 2 × 2.7e9 / (w+1) |
+| Hash table | ~7 GiB | ~8 bytes per minimizer |
+| Packed sequence | ~0.7 GiB | 2 bits per base |
+| **Resident total** | **~8 GiB** | plus ~1 GiB working memory |
+
+**That does not fit in 5 GiB available**, and the *build* peaks higher still.
+So on this laptop as configured, pick one:
+
+- **Raise the memory ceiling** — see [Appendix: more
+  memory](#appendix-more-memory). This is WSL2, so the 7.6 GiB is an
+  allocation, not the hardware. If the laptop physically has 16 or 32 GB this
+  is a one-line config change and the whole-genome path opens up. **Check this
+  before accepting the constraint.**
+- **Use a subset reference** — index only the chromosomes your GTF covers.
+  Covered at [Step 5b](#step-5b-alternative--subset-reference).
+- **Align on a bigger machine.** The index cannot be built elsewhere and
+  copied back: it has to be resident *during* alignment, so the machine that
+  holds it must also do the aligning.
+
+These estimates are arithmetic, not measurements — minimap2 has never been run
+in this environment. Measure with `/usr/bin/time -v` on the index build and
+trust that over the table above.
 
 ---
 
-## Step 0 — install the tools
-
-`minimap2`, `samtools`, `seqkit` and `pigz` are declared in
-`sandbox/pixi.toml`. They are **not yet installed** — the lockfile has not been
-regenerated, so run this once:
+## Step 1 (RECOMMENDED) — install the tools
 
 ```bash
 cd sandbox
 pixi install
 ```
 
-This also picks up the `plotly` / `kaleido` / `streamlit` pins added for
-`viz_scripts`. Then prefix commands with `pixi run`, or `pixi shell` once and
-drop the prefix.
+Then confirm all four are present:
+
+```bash
+pixi run minimap2 --version
+pixi run samtools --version | head -1
+pixi run seqkit version
+pixi run pigz --version
+```
+
+If `minimap2` is missing after this, the manifest and the lock file have
+drifted apart — check that `pixi.toml` lists it under `[dependencies]` and
+re-run `pixi install`.
+
+**Always invoke the pipeline through `pixi run`.** Running the script directly
+picks up whatever `minimap2` happens to be on your `PATH`, which may be a
+different version than the one pinned here, and version drift in an aligner
+changes results.
 
 ---
 
-## Step 1 — the `.env` file
-
-The script reads configuration from `.env` at the **repo root** via
-`set -a; source .env; set +a`, so every variable it defines becomes available
-to the tools without ever being echoed.
-
-I could not read your `.env` — it is masked from my environment — so the
-variable names below are what the script *expects*. Reconcile them with what
-you already have; anything absent falls back to the default in the right-hand
-column.
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `FASTQ_DIR` | where the reads are | `sandbox/big_data` |
-| `BAM_DIR` | where BAMs go | `sandbox/big_data/bam` |
-| `REF_FASTA` | reference genome FASTA | *(required)* |
-| `REF_MMI` | prebuilt minimap2 index; skips the build | derived from `REF_FASTA` |
-| `REF_GTF` | annotation, passed on to nexons | *(unset)* |
-| `THREADS` | alignment threads | `nproc` |
-| `SORT_THREADS` / `SORT_MEM` | `samtools sort` resources | `4` / `512M` |
-| `TMPDIR` | sort spill directory | `sandbox/big_data/tmp` |
-| `SECONDARY` | emit secondary alignments (`yes`/`no`) | `no` |
-| `JUNC_BED` | annotated junctions to reward | *(unset — see below)* |
-| `FTP_HOST` / `FTP_USER` / `FTP_PASS` | download credentials | *(unset)* |
-
-### Why `TMPDIR` points away from `/tmp`
-
-`/tmp` here is a **3.9 GiB tmpfs** — RAM, not disk. `samtools sort` spills
-roughly the size of the final BAM, several GiB for one barcode, so sending it
-to `/tmp` fails two ways at once: it runs out of room, *and* every byte it does
-write occupies memory that minimap2 needs for its index. A sort that dies
-part-way throws away the alignment work that preceded it.
-
-So `TMPDIR` defaults to `sandbox/big_data/tmp` on the ext4 volume, which has
-**689 GiB free**. **You do not need to enlarge `/tmp` for this pipeline** — it
-is never used.
-
-One way that default can be bypassed: `TMPDIR="${TMPDIR:-...}"` honours an
-existing value, and many shells and job schedulers export `TMPDIR` already. The
-script therefore checks at startup and, before aligning anything:
-
-- refuses to start if `TMPDIR` or `BAM_DIR` has less free space than the run
-  needs (budgeting half the total input size on each, since a BAM runs
-  0.35–0.5× its uncompressed FASTQ);
-- warns if `TMPDIR` resolves onto a tmpfs, naming the RAM cost.
-
-Both print before the first read is aligned, so a space problem costs you
-seconds rather than the better part of an hour. Check what it resolved to in
-the `[tmp]` line of the startup banner.
-
-### If you still want a bigger `/tmp`
-
-Confirm what you actually have first — the numbers above are what I measured,
-and your shell may see something different:
-
-```bash
-df -h /tmp && findmnt /tmp
-```
-
-If `FSTYPE` is `tmpfs`, resizing costs RAM, which on this machine is the scarce
-resource rather than disk. Temporarily, until reboot:
-
-```bash
-sudo mount -o remount,size=8G /tmp
-```
-
-Persistently, add to `/etc/fstab` (WSL honours it — `mountFsTab` defaults on):
-
-```
-tmpfs /tmp tmpfs rw,nosuid,nodev,size=8G 0 0
-```
-
-Better on a memory-limited box: make `/tmp` disk-backed instead of larger, so
-it costs no RAM at all:
-
-```bash
-sudo mkdir -p /var/tmpdisk && sudo chmod 1777 /var/tmpdisk
-sudo mount --bind /var/tmpdisk /tmp
-```
-
-But for this pipeline all three are unnecessary — setting `TMPDIR` in `.env` is
-the same fix without touching system mounts.
-
-### Credentials
-
-Keep them out of the shell and out of git. `.env` is already gitignored at the
-repo root. A password passed on a command line is visible to every user on the
-machine via `ps`, so prefer a `~/.netrc`:
-
-```
-machine <ftp-host>
-  login    <username>
-  password <password>
-```
-
-```bash
-chmod 600 ~/.netrc
-```
-
-The real host, user and password go in `.env` (`FTP_HOST` / `FTP_USER` /
-`FTP_PASS`) or `~/.netrc`, never in a file under version control. This repo is
-a fork of a public one, so assume anything committed here is world-readable:
-`.env.example` documents the variable names, `.env` holds the values and is
-gitignored.
-
-> Two habits worth keeping. A password passed as a command-line argument is
-> visible in `ps` to every user on the machine, which is why the commands below
-> use `--netrc` rather than `--user`. And if a credential is ever pasted
-> somewhere it should not be — a chat window, a ticket, a shared notebook —
-> treat it as compromised and have it rotated rather than hoping it went
-> unnoticed.
-
----
-
-## Step 2 — download
-
-Already done in your case; recorded for reproducibility. With `~/.netrc` in
-place, no secret appears on the command line:
-
-```bash
-mkdir -p sandbox/big_data && cd sandbox/big_data
-lftp -e "mirror --verbose --parallel=4 $REMOTE_DIR ; quit" "$FTP_HOST"
-# or, per-file:
-curl --netrc -O "ftp://$FTP_HOST/$REMOTE_DIR/<run>_pass_L001_barcode01.fastq.gz"
-```
-
-`lftp mirror` is worth it over `curl` for a multi-GB transfer: it resumes
-(`mirror --continue`) and parallelises across files.
-
----
-
-## Step 3 — verify the transfer
-
-Do this before spending an hour of CPU on it:
+## Step 2 (RECOMMENDED) — create the folder layout
 
 ```bash
 cd sandbox/big_data
-ls -la *.part                     # must return nothing
-pixi run seqkit stats -a *.fastq  # read count, N50, mean length
-```
-
-If the file really is gzipped, `gzip -t file.fastq.gz` should be silent; a
-truncated gzip reports `unexpected end of file`. For a plain FASTQ, a record
-count divisible by four is the equivalent check:
-
-```bash
-awk 'END{print NR, NR%4}' *_barcode01.fastq   # second number must be 0
+mkdir -p input outputs reference tmp
 ```
 
 ---
 
-## Step 4 — the reference, and the memory problem
+## Step 3 (RECOMMENDED) — set the environment variables
 
-**This is the step that decides whether the job runs on this laptop at all.**
-
-The `splice` preset uses `-k15 -w5`. That `w=5` window is half of `map-ont`'s
-`w=10`, so the minimizer table holds roughly twice as many entries, and a
-whole-GRCh38 splice index runs to well over ten gigabytes. This machine has
-**7.6 GiB of RAM total and ~5.5 GiB free**. A whole-genome `-x splice` index
-build will be OOM-killed, usually with no message beyond the shell reporting
-`Killed`.
-
-The numbers below are estimates from how minimap2's index scales, not
-measurements — I had no minimap2 binary available to measure them. Confirm the
-peak yourself with:
+The script reads `$REPO/.env` — the repo root, *not* the sandbox. Start from
+the template:
 
 ```bash
-/usr/bin/time -v pixi run minimap2 -x splice -t 8 -d ref.splice.mmi ref.fa \
-  2>&1 | grep 'Maximum resident'
+cd /path/to/nexons
+cp .env.example .env
 ```
 
-You have three ways forward.
-
-### Option A — targeted reference (recommended here)
-
-nexons quantifies the genes in a GTF. If that GTF covers one locus or a handful
-of genes, indexing 3.1 Gb of genome to align against 60 Mb of it is wasted work
-and wasted RAM. Extract the relevant chromosome(s):
+Then edit `.env` to this:
 
 ```bash
-cd sandbox/big_data
-# GRCh38 chromosome 19 (UNC13A is at 19p13.11) -- 16.7 MB gzipped, ~59 Mb of sequence
-curl -O https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.chromosome.19.fa.gz
-# Ensembl ships plain gzip, not bgzip, so `samtools faidx` cannot read it
-# directly -- it needs either an uncompressed or a bgzipped FASTA.
-gunzip Homo_sapiens.GRCh38.dna.chromosome.19.fa.gz
-pixi run samtools faidx Homo_sapiens.GRCh38.dna.chromosome.19.fa
+# --- data locations ---
+FASTQ_DIR=$SANDBOX/big_data/input
+BAM_DIR=$SANDBOX/big_data/outputs
+TMPDIR=$SANDBOX/big_data/tmp
+
+# --- reference ---
+REF_MMI=$SANDBOX/big_data/reference/Mus_musculus_GRCm39_2026_04.mmi
+REF_GTF=$SANDBOX/big_data/reference/Mus_musculus.GRCm39.116.gtf.gz
+REF_FASTA=
+
+# --- resources ---
+THREADS=8
+SORT_THREADS=4
+SORT_MEM=512M
+SECONDARY=no
 ```
 
-Index build drops to seconds and well under 1 GiB; alignment is several times
-faster because there are far fewer seed hits to extend.
+Four things to get right here.
 
-The cost is real and you should state it in any methods section: reads whose
-true origin is elsewhere in the genome have nowhere else to go, so they either
-fail to map or get forced onto the subset. For a paralogous gene family that
-inflates apparent expression. Subset only when the analysis is genuinely
-targeted, and make sure the GTF you give nexons is subset to match.
+**`$SANDBOX` and `$REPO` are set by the script before it sources `.env`**, so
+these paths stay correct no matter which directory you run from. A bare
+relative path like `sandbox/big_data/input` is resolved against your *current*
+directory and breaks the moment you `cd` anywhere.
 
-### Option B — whole genome, split index
+**`REF_MMI` is the genome you align TO.** It is never your reads. Reads have no
+variable — they are found in `FASTQ_DIR` or passed as arguments. The script
+rejects a FASTQ in either reference variable by name, because the bare "does
+not exist" error gives no hint as to the cause.
 
-`-I` caps how many reference bases minimap2 loads at once, bounding memory:
+**Set either `REF_MMI` or `REF_FASTA`, not both.** With only `REF_FASTA` the
+script builds the index once and reuses it. With `REF_MMI` it uses the index as
+given. Leave the other empty.
 
-```bash
-pixi run minimap2 -ax splice -I 1G -t 8 GRCh38.fa reads.fastq > out.sam
-```
+**`SORT_MEM` is per thread.** `SORT_THREADS=4` with `SORT_MEM=512M` reserves
+about 2 GiB in total, not 512 MiB. This is an easy way to request several times
+more memory than you intended.
 
-Memory stays inside the cap, but minimap2 makes one pass over the reads **per
-part** — four passes for GRCh38 at `-I 1G` — so wall time multiplies roughly
-fourfold. The more serious problem is downstream: each part is aligned
-independently, so mapping quality and the primary/secondary flags are only
-meaningful *within* a part. A read with hits in two parts emerges with a
-primary alignment in each. nexons counts primary alignments, so that
-double-counts. If you go this route you must collapse to one alignment per read
-first, which is enough extra machinery that Option A or C is usually the better
-trade.
-
-### Option C — whole genome, bigger machine
-
-The clean answer if you need genome-wide alignment with trustworthy MAPQ.
-Aligning against a prebuilt index still needs the whole index resident, so
-building the `.mmi` elsewhere and copying it back does **not** help — the
-bigger machine has to do the alignment too. Everything below therefore runs on
-that machine, not on the laptop.
-
-Nothing about the pipeline changes. You point `REF_FASTA` at the whole genome
-instead of chromosome 19 and run the same script; it builds the index on first
-invocation and reuses it afterwards.
-
-**1. Get the reference.** Use `primary_assembly`, *not* `toplevel`:
-
-```bash
-cd sandbox/big_data
-curl -L --fail -O https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
-```
-
-`toplevel` also contains haplotype and patch scaffolds. They inflate the index
-and, worse, give reads a second near-identical place to map, which collapses
-MAPQ and quietly changes what nexons counts. `primary_assembly` is the one you
-want. minimap2 reads gzipped FASTA directly, so leave it compressed.
-
-**2. Build the index** (the memory-hungry step, ~10–20 min):
-
-```bash
-pixi run minimap2 -x splice -t 16 \
-  -d Homo_sapiens.GRCh38.dna.primary_assembly.splice.mmi \
-     Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
-```
-
-`-x splice` matters: it sets `k=15, w=5`, and those values are baked into the
-`.mmi`. An index built under a different preset is silently used with *its*
-k/w, not the one you ask for at alignment time. Do **not** add `-I 1G` here —
-that splits the index and forces `--split-prefix` at alignment time, which is
-Option B. At the default `-I 4G` the 3.1 Gbase genome indexes as a single
-batch, which is what you want.
-
-You can skip this step and let the script do it — it runs exactly this command
-when `REF_MMI` is unset. Doing it by hand just separates the one failure you
-care about from a four-hour pipeline run.
-
-**3. Run the pipeline:**
+Check it loads:
 
 ```bash
 cd sandbox
-REF_MMI=big_data/Homo_sapiens.GRCh38.dna.primary_assembly.splice.mmi \
-FASTQ_DIR=big_data \
-BAM_DIR=big_data/bam \
-THREADS=16 SORT_THREADS=4 SORT_MEM=1G \
-TMPDIR=big_data/tmp \
-  ./fastq_to_bam/fastq_to_bam.sh
+pixi run ./fastq_to_bam/fastq_to_bam.sh
 ```
 
-Set these in `.env` instead if you prefer; the script reads them from there.
+It will stop at the first thing that is actually missing. The line
+`[env] loaded /path/to/nexons/.env` confirms the file was found.
 
-**Budget the RAM, don't just scale it.** The index stays resident for the whole
-alignment, and `samtools sort` runs *concurrently* with it off the same pipe,
-using roughly `SORT_THREADS × SORT_MEM`. So more cores does not mean you should
-raise the sort allocation:
+---
 
-| Machine | `THREADS` | `SORT_THREADS` × `SORT_MEM` | Rough peak |
-|---|---|---|---|
-| 32 GB / 16 core | 16 | 4 × 768M (≈3 GiB) | ~22 GiB |
-| 64 GB / 32 core | 32 | 8 × 2G (≈16 GiB) | ~36 GiB |
+## Step 4 (RECOMMENDED) — download the reference
 
-On a 32 GB machine keep the sort small — the index is the tenant that cannot be
-evicted. `TMPDIR` must be on a real disk with ~2× the BAM size free, and it
-must not be a tmpfs; the script checks both and aborts up front.
-
-The index sizes and peaks above are **estimates, not measurements** — I had no
-minimap2 binary to measure them. minimap2's own figure for a default human
-index is ~11 GiB peak; `-x splice` uses `w=5` instead of `w=10`, which roughly
-doubles the minimizer count, hence ≥32 GB rather than 16. Confirm with
-`/usr/bin/time -v` on the index build before planning a long run around it.
-
-**4. Sanity-check that it was worth it.** The point of the whole genome is
-reads that chr19 had nowhere to put, so measure that:
+Mouse GRCm39, Ensembl release 116. Both URLs and sizes below were checked
+against the server.
 
 ```bash
-pixi run samtools idxstats big_data/bam/<sample>.bam \
-  | awk '{m+=$3} END {printf "mapped: %d\n", m}'
-pixi run samtools view -c -f 4 big_data/bam/<sample>.bam   # still unmapped
+cd sandbox/big_data/reference
+
+# Genome, 806 MB gzipped, ~2.7 Gbase
+curl -L --fail -O \
+  https://ftp.ensembl.org/pub/release-116/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+
+# Annotation for nexons, 108 MB gzipped
+curl -L --fail -O \
+  https://ftp.ensembl.org/pub/release-116/gtf/mus_musculus/Mus_musculus.GRCm39.116.gtf.gz
 ```
 
-If the mapped count is within a percent or two of your chr19 run for the genes
-in your GTF, Option A was sufficient and you can go back to it.
+Use **`primary_assembly`**, not `toplevel`. `toplevel` additionally contains
+haplotype and patch scaffolds, which give many reads a second near-identical
+place to map: mapping quality collapses toward zero, and what nexons counts
+changes quietly rather than failing.
 
-### Option D — raise the WSL memory limit
+`--fail` matters. Without it curl writes an HTML error page into the `.fa.gz`
+and you discover it during the index build.
 
-**Check this before accepting the 8 GB ceiling.** This is WSL2
-(`6.18.33.2-microsoft-standard-WSL2`), and the 7.6 GiB that `free -h` reports
-is WSL's *allocation*, not the laptop's RAM — by default WSL2 takes 50% of
-Windows' total, historically capped at 8 GB. If the laptop physically has 16 or
-32 GB, most of it is simply not being offered to Linux, and the whole-genome
-index that "exceeds this machine's RAM" above may fit after one config change.
+Verify before going further:
+
+```bash
+ls -lh
+gzip -t Mus_musculus.GRCm39.dna.primary_assembly.fa.gz && echo "genome OK"
+gzip -t Mus_musculus.GRCm39.116.gtf.gz && echo "gtf OK"
+```
+
+Two consistency requirements. The **assembly must match** — a GRCm39 GTF
+against a GRCm38/mm10 genome puts every coordinate in the wrong place without
+erroring. And **chromosome naming must match**: Ensembl uses `1`, `19`, `X`
+where UCSC uses `chr1`, `chr19`, `chrX`. Mixing the conventions is not an
+error; it produces zero counts everywhere. Both files above are Ensembl, so
+they agree with each other.
+
+Do not decompress the genome. minimap2 reads gzip directly.
+
+---
+
+## Step 5 (RECOMMENDED) — build the minimap2 index
+
+Only if you were not handed one. **If a collaborator gave you
+`Mus_musculus_GRCm39_2026_04.mmi`, skip the build but check two things**: its
+size against Step 0, and which preset built it.
+
+```bash
+cd sandbox
+pixi run minimap2 -x splice -t 16 \
+  -d big_data/reference/Mus_musculus_GRCm39_2026_04.mmi \
+     big_data/reference/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+```
+
+`-x splice` is load-bearing here, not just at alignment time: **`k` and `w` are
+baked into the `.mmi`**. If the index was built with a different preset,
+minimap2 silently uses the index's values and ignores the `-x splice` you pass
+later, with only a warning that is easy to miss. An index built with
+`-x map-ont` (`w=10`) gives quietly worse sensitivity on short exons.
+
+Do not add `-I 1G`. That splits the index into batches and then requires
+`--split-prefix` at alignment time. At the default `-I 4G` the mouse genome
+indexes as a single batch.
+
+Time it and watch the peak, because this is the step most likely to be killed:
+
+```bash
+/usr/bin/time -v pixi run minimap2 -x splice -t 16 -d ... 2>&1 | grep -E "Maximum resident|Elapsed"
+```
+
+### Step 5b (alternative) — subset reference
+
+If Step 0 said the whole genome will not fit and you cannot raise the ceiling,
+index only the chromosomes your GTF actually covers. For a defined gene panel
+this costs nothing in accuracy for those genes.
+
+```bash
+cd sandbox/big_data/reference
+
+# Example: chromosomes 2 and 11 only. Substitute your own.
+for c in 2 11; do
+  curl -L --fail -O \
+    "https://ftp.ensembl.org/pub/release-116/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.chromosome.$c.fa.gz"
+done
+cat Mus_musculus.GRCm39.dna.chromosome.*.fa.gz > GRCm39_subset.fa.gz
+
+cd ../..
+pixi run minimap2 -x splice -t 16 \
+  -d big_data/reference/Mus_musculus_GRCm39_2026_04.subset.mmi \
+     big_data/reference/GRCm39_subset.fa.gz
+```
+
+Concatenating gzip members is valid gzip, so `cat` on `.fa.gz` files works.
+
+Point `REF_MMI` at the `.subset.mmi` and **subset the GTF to the same
+chromosomes**, or nexons will look for genes that are not in the BAM:
+
+```bash
+zcat Mus_musculus.GRCm39.116.gtf.gz \
+  | awk '$1=="2" || $1=="11" || /^#/' \
+  | gzip > GRCm39_subset.116.gtf.gz
+```
+
+Reads whose true origin is outside the subset will either fail to map or
+mis-map onto the included chromosomes. That is acceptable for panel
+quantification and **not** acceptable for anything transcriptome-wide.
+
+---
+
+## Step 6 (RECOMMENDED) — put the reads in `input/`
+
+```bash
+mv /wherever/PBM75668_pass_L001_barcode01.fastq.gz sandbox/big_data/input/
+```
+
+**The script refuses to start if any `*.part`, `*.filepart` or `*.crdownload`
+file is present in `FASTQ_DIR`.** This is intentional. A partly-transferred
+FASTQ is a valid-looking file that is simply missing its tail; minimap2 aligns
+it and exits 0, so the truncation surfaces as missing counts in nexons rather
+than as an error.
+
+Verify each file is complete before aligning. A FASTQ record is exactly four
+lines, so a complete file has a line count divisible by four:
+
+```bash
+cd sandbox/big_data/input
+for f in *.fastq*; do
+  awk 'END{printf "%s: %d reads, remainder %d -> %s\n", FILENAME, NR/4, NR%4, \
+       (NR%4==0 ? "OK" : "TRUNCATED")}' "$f"
+done
+```
+
+This reads the whole file, so it takes a minute or two per barcode. It is worth
+it — it is the difference between a wrong answer and no answer.
+
+### The two files currently in this repo
+
+Both are still named `.part` and sat unchanged for hours, so the transfers are
+dead rather than slow. Checked by record count:
+
+| File | Reads | Lines mod 4 | Verdict |
+|---|---|---|---|
+| `barcode01` | 3,442,720 | 0 | Complete — usable |
+| `barcode02` | 3,796,680 | **2** | **Truncated mid-record** — re-fetch |
+
+To use barcode01:
+
+```bash
+cd sandbox/big_data
+mv PBM75668_pass_L001_barcode01.2AM3fGSx.fastq.gz.part \
+   input/PBM75668_pass_L001_barcode01.fastq
+```
+
+Note the extension. **Despite the `.gz` in the original name this file is
+plain text, not gzip** — naming it `.fastq.gz` would make `zcat`, `gzip -t` and
+`seqkit` fail on it. (minimap2 itself would cope; it sniffs the format.) Move
+barcode02 out of `input/` until it has been re-fetched.
+
+A record-aligned line count means the file ends on a record boundary. It is
+strong evidence, not proof the run had no further reads — compare against the
+expected yield from the sequencing report if you have it.
+
+---
+
+## Step 7 (RECOMMENDED) — run the pipeline
+
+```bash
+cd sandbox
+pixi run ./fastq_to_bam/fastq_to_bam.sh
+```
+
+That aligns every FASTQ in `input/`. For one file:
+
+```bash
+pixi run ./fastq_to_bam/fastq_to_bam.sh big_data/input/PBM75668_pass_L001_barcode01.fastq
+```
+
+Per input, the script runs exactly this — the command from
+[`COMMAND_EXPLAINED.md`](COMMAND_EXPLAINED.md), plus the three things that
+command omits:
+
+```bash
+minimap2 -ax splice --secondary=no -t 8 \
+         big_data/reference/Mus_musculus_GRCm39_2026_04.mmi \
+         big_data/input/PBM75668_pass_L001_barcode01.fastq \
+  | samtools sort -@ 4 -m 512M \
+                  -T big_data/tmp/sort.PBM75668_pass_L001_barcode01 \
+                  -o big_data/outputs/PBM75668_pass_L001_barcode01.bam -
+
+samtools index -@ 4 big_data/outputs/PBM75668_pass_L001_barcode01.bam
+samtools flagstat big_data/outputs/PBM75668_pass_L001_barcode01.bam
+```
+
+The additions are the `.bai` index (nexons queries by region and needs it), an
+explicit `-T` sort scratch directory, and `-@`/`-m` instead of samtools' rather
+conservative one-thread default.
+
+Expect these on stdout:
+
+```
+[env]   loaded /path/to/nexons/.env
+[ref]   .../Mus_musculus_GRCm39_2026_04.mmi (8.0 GiB)
+[cpu]   minimap2 -t 8 | samtools sort -@ 4 -m 512M
+[out]   .../big_data/outputs
+[in]    1 file(s)
+[align] PBM75668_pass_L001_barcode01
+[done]  PBM75668_pass_L001_barcode01 in 47m12s -> .../barcode01.bam
+```
+
+A `WARNING: this may not fit in memory` line here is Step 0 catching you late;
+stop and deal with it rather than hoping.
+
+Re-running is safe. A BAM newer than its input is reported as `[skip]`, so an
+interrupted batch resumes rather than redoing finished barcodes. `THREADS=8`
+is deliberate on a 16-core box: it leaves cores for the concurrent sort.
+`-t16` has both programs contending for every core and typically runs *slower*
+end to end.
+
+### Timing
+
+No measured figure exists for this environment — minimap2 has never
+successfully run here. For an estimate on your own hardware, use the archived
+script's benchmark mode, which aligns *n* reads and extrapolates:
+
+```bash
+BENCHMARK=200000 pixi run ./fastq_to_bam/fastq_to_bam.sh.old
+```
+
+For scale: barcode01 is 3,442,720 reads / 4.17 Gbase, mean read length
+1,211 bp, and its uncompressed FASTQ carries roughly 466 Mbase per GiB. Note
+that transfer and alignment overlap — finished barcodes can be aligned while
+the rest are still arriving.
+
+---
+
+## Step 8 (RECOMMENDED) — check the outputs
+
+```bash
+cd sandbox/big_data/outputs
+ls -lh
+samtools flagstat PBM75668_pass_L001_barcode01.bam
+samtools idxstats PBM75668_pass_L001_barcode01.bam | head
+```
+
+What to look for:
+
+| Check | Expected | If it fails |
+|---|---|---|
+| `.bam` **and** `.bam.bai` present | both | nexons cannot do region queries without the `.bai` |
+| Mapped % in `flagstat` | high for cDNA on its own genome | A few percent means wrong assembly, wrong organism, or a truncated input |
+| `idxstats` chromosome names | `1`, `2`, `19` … | If these are `chr1`-style, your GTF must match or counts come out zero |
+| `secondary` in `flagstat` | 0 | Expected: `--secondary=no`. It means *not measured*, not *no ambiguity* |
+| Total reads vs input | comparable | A large shortfall points at a truncated FASTQ |
+
+The mapped-read count is the denominator nexons' totals should be read
+against, so record it.
+
+---
+
+## Step 9 (RECOMMENDED) — hand it to nexons
+
+```bash
+cd /path/to/nexons
+python nexons.py \
+  sandbox/big_data/reference/Mus_musculus.GRCm39.116.gtf.gz \
+  sandbox/big_data/outputs/*.bam \
+  --direction none \
+  --outbase sandbox/big_data/outputs/nexons_run1
+```
+
+`--direction none` is correct for this library: ONT cDNA is unstranded, so
+requiring a strand match would discard roughly half the reads. Use the same
+GTF you verified in Step 4 — and if you took the Step 5b subset path, the
+*subset* GTF.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `Killed`, no other output | Out of memory. Step 0. Usually the index |
+| `ERROR: minimap2 is not on PATH` | Not running through `pixi run`, or `pixi install` incomplete |
+| `ERROR: REF_MMI looks like sequencing reads` | A FASTQ in a reference variable. Reads go in `FASTQ_DIR` |
+| `ERROR: ... does not exist` on a path in `.env` | Relative path resolved against your cwd. Use `$SANDBOX/...` |
+| `ERROR: unfinished download(s)` | A `.part` file in `input/`. Finish or move it aside |
+| `WARNING: TMPDIR ... is a tmpfs` | Sort spills would consume RAM. Point `TMPDIR` at the data volume |
+| Everything maps but counts are zero | Chromosome naming mismatch between GTF and reference |
+| `gzip: not in gzip format` | A plain FASTQ under a `.gz` name. Rename it |
+| samtools parse error at the pipe | `-a` missing from minimap2, so it emitted PAF not SAM |
+| BAM exists but nexons cannot read regions | No `.bai`. Run `samtools index` |
+
+---
+
+## Appendix: more memory
+
+### Raise the WSL allocation
+
+**Check this before accepting the 8 GB ceiling.** This is WSL2, and the
+7.6 GiB that `free -h` reports is WSL's *allocation*, not the laptop's RAM — by
+default WSL2 takes 50% of Windows' total, historically capped at 8 GB. If the
+laptop physically has 16 or 32 GB, most of it is simply not being offered to
+Linux, and the whole-genome index that does not fit above may fit after one
+config change.
 
 Check the physical total from PowerShell:
 
@@ -443,7 +487,7 @@ Check the physical total from PowerShell:
 (Get-CIMInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
 ```
 
-If that comes back well above 8, create or edit `C:\Users\<you>\.wslconfig`:
+If that is well above 8, create or edit `C:\Users\<you>\.wslconfig`:
 
 ```ini
 [wsl2]
@@ -458,167 +502,42 @@ Then, from PowerShell:
 wsl --shutdown
 ```
 
-and reopen the shell. Confirm with `free -h` inside WSL. With ~24 GB the
-GRCh38 splice index builds comfortably and Option A stops being a constraint.
+and reopen the shell. Confirm with `free -h`. With ~24 GB the GRCm39 splice
+index builds comfortably and the subset path stops being necessary.
 
 Two caveats. WSL's memory is reserved from Windows while in use, so
-over-allocating makes Windows itself swap — leave it real headroom. And the
-`.wslconfig` file lives on the Windows side, outside this repo, so it is not
+over-allocating makes Windows itself swap — leave it real headroom. And
+`.wslconfig` lives on the Windows side, outside this repo, so it is not
 version-controlled with the pipeline; note the setting in your methods if the
 analysis depends on it.
+
+### Why `TMPDIR` points away from `/tmp`
+
+`samtools sort` holds `SORT_THREADS × SORT_MEM` in RAM and spills the excess to
+`$TMPDIR`. On this machine `/tmp` is a **tmpfs** — RAM, not disk — so spilling
+there both runs out of room and steals the memory minimap2 is using for the
+index. `.env` therefore points `TMPDIR` at the data volume. A sort that dies on
+a full `/tmp` throws away the alignment work that preceded it.
 
 ### A note on `JUNC_BED`
 
 minimap2's `--junc-bed` rewards junctions present in an annotation. That
-improves accuracy on known transcripts — and biases against exactly the thing
-this project is looking for. A cryptic exon is by definition unannotated, so
-annotated-junction bonuses push reads toward the canonical splice form and
-suppress the signal. **Leave `JUNC_BED` unset for cryptic exon work.** It is
-wired up for the case where you are quantifying known isoforms instead.
+improves accuracy on known transcripts — and biases against unannotated ones. A
+cryptic exon is by definition unannotated, so annotated-junction bonuses push
+reads toward the canonical splice form and suppress the signal. **Leave it
+unset for cryptic exon work.** It is wired up only in the archived script.
 
 ---
 
-## Step 5 — run it
+## Also available
 
-```bash
-cd sandbox/fastq_to_bam
-pixi run ./fastq_to_bam.sh                    # everything in $FASTQ_DIR
-pixi run ./fastq_to_bam.sh ../big_data/one.fastq   # a single file
-```
+[`fastq_to_bam_examples.ipynb`](fastq_to_bam_examples.ipynb) walks the same
+pipeline stage by stage with the preflight checks, a read-length plot and a
+throughput measurement, using the pixi environment as its kernel
+(**Python (nexons pixi)**). It is cheap and subsampled by default, degrades
+rather than fails when tools are missing, and is generated by
+`build_fastq_notebook.py` — edit the builder, not the notebook. Clear outputs
+before committing.
 
-The alignment is piped straight into `samtools sort`, so no intermediate SAM is
-ever written — that would cost roughly twice the FASTQ size in disk for nothing.
-Per input the script writes `$BAM_DIR/<sample>.bam` plus `.bai`, then prints
-`flagstat`. Re-running skips any sample whose `.bai` is newer than its FASTQ, so
-an interrupted batch resumes.
-
-**Measure before committing to the full run:**
-
-```bash
-BENCHMARK=200000 pixi run ./fastq_to_bam.sh
-```
-
-That aligns 200k reads, reports Mbase/s and Gbase/hour for your actual
-reference and thread count, and converts it to minutes per GiB of FASTQ. Two
-minutes of measurement beats any estimate in this file.
-
----
-
-## Step 6 — check the BAM
-
-```bash
-pixi run samtools flagstat sample.bam
-pixi run samtools view -c -F 0x904 sample.bam    # primary mapped reads
-pixi run samtools view sample.bam | awk '$6 ~ /N/' | head   # spliced (N in CIGAR)
-```
-
-Three things to look at:
-
-- **Mapped fraction.** ONT cDNA against a matched whole genome should be well
-  above 90%. A low fraction against a subset reference is expected, not a bug.
-- **Reads with `N` in the CIGAR.** `N` is the spliced gap. If essentially no
-  read has one, the index was built without `-x splice` and nexons will see an
-  unspliced pile of reads. This is the most common silent failure.
-- **`samtools quickcheck sample.bam`** — exits non-zero on a truncated BAM,
-  which is what you get if the sort ran out of disk.
-
----
-
-## Step 7 — hand it to nexons
-
-```bash
-cd ../..
-python nexons.py annotation.gtf sandbox/big_data/bam/*.bam \
-    --direction none \
-    --outbase sandbox/big_data/nexons_out \
-    --annotated-bam sandbox/big_data/annotated
-```
-
-`--direction none` for this unstranded cDNA library. `--annotated-bam` writes
-the per-read classification tags that `sandbox/viz_scripts/nexons_viz.py`
-renders — see `viz_scripts/README.md`.
-
-The GTF must use the same contig names as the reference FASTA. Ensembl FASTA
-headers are `19`; UCSC are `chr19`. Mixing them yields a BAM that indexes fine
-and a nexons run that finds nothing at all.
-
----
-
-## Time and memory
-
-The input size is measured; the throughputs are not. `-ax splice` is taken at
-1.5–4 Mbase/s across 16 threads against a whole genome, and roughly 6–15
-Mbase/s against a single chromosome, because there are far fewer seed hits to
-extend. I had no minimap2 binary available to measure this, so **treat the
-times as order-of-magnitude** and get the real number from
-`BENCHMARK=200000` before planning around them.
-
-Per stage, for 16 cores / 8 GB RAM:
-
-| Stage | Targeted reference (chr19) | Whole GRCh38 |
-|---|---|---|
-| Index build | ~10 s, <1 GiB RAM | **exceeds this machine's RAM** |
-| Peak RAM while aligning | ~1–2 GiB | >10 GiB for the index alone |
-| Alignment, per Gbase of reads | ~1–3 min | ~4–11 min |
-| `samtools sort` + index | ~1–2 min per GiB of BAM | same |
-
-### For one barcode
-
-`barcode01` is 3,442,720 reads / **4.17 Gbase** / 8.9 GiB on disk:
-
-| | chr19 | Whole GRCh38 |
-|---|---|---|
-| Alignment | 5–12 min | 17–46 min |
-| Sort + index | 5–10 min | 5–10 min |
-| **Per barcode** | **~12–20 min** | ~25–55 min |
-
-### For the run
-
-This is multiplexed, so multiply. Two barcodes were downloading when this was
-written and the total is unknown; the arithmetic is linear in barcode count:
-
-| Barcodes | FASTQ total | chr19 | Whole genome (≥32 GB machine) |
-|---|---|---|---|
-| 2 | ~18 GiB | 25–40 min | 50 min – 2 h |
-| 6 | ~53 GiB | 1.2–2 h | 2.5–5.5 h |
-| 12 | ~107 GiB | 2.5–4 h | 5–11 h |
-
-Add the transfer: at the observed 9–11 MiB/s each 8.9 GiB barcode takes about
-15 minutes, so on a 12-barcode run the download alone is ~3 hours and is
-comparable to the whole alignment cost on chr19. The two overlap, though — you
-can start aligning finished barcodes while the rest download, and the script's
-`.part` guard plus its skip-if-newer logic make repeated invocation safe.
-
-Disk, so you can plan: **689 GiB free** on the ext4 volume (it was 708 GiB
-before the first two barcodes landed — each one costs ~9 GiB), which is ample
-even for a 12-barcode run. Expect each BAM at roughly 0.35–0.5× its
-uncompressed FASTQ (~3–4 GiB per barcode), sort temporaries about the same
-again transiently, and a whole-genome splice `.mmi` over 10 GiB if you build
-one. Note that `/tmp`'s 3.9 GiB does not enter into this: it is a RAM-backed
-tmpfs and the pipeline does not use it.
-
-**Recommendation: check Option D first, then default to Option A.** If the
-laptop physically has more than 8 GB, raising the WSL memory limit is a
-one-line config change that removes the constraint entirely and costs nothing
-scientifically. Failing that, subset the reference to the chromosomes your GTF
-covers (Option A) and the whole thing finishes inside half an hour with RAM to
-spare — at the cost, stated in your methods, that reads originating elsewhere
-in the genome have nowhere else to go.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause |
-|---|---|
-| `Killed` during index build, no other output | OOM. Reference too big for 8 GB — Option A or `-I 1G` |
-| Script refuses to start, names a `.part` file | Download unfinished. Wait for it |
-| BAM has no `N` in any CIGAR | Index built without `-x splice`. Delete the `.mmi` and rebuild |
-| `samtools sort` fails late with a disk error | Sort spilled into a full filesystem. Check the `[tmp]` startup line; set `TMPDIR` onto the big volume in `.env` |
-| Script aborts naming free space before aligning | The disk preflight. `TMPDIR` or `BAM_DIR` is too small for ~half the input size |
-| `WARNING: ... is on tmpfs` | `TMPDIR` was inherited from the shell onto RAM-backed storage. Unset it or point it at disk |
-| `Killed` with plenty of disk free | RAM, not disk. See Option D (WSL memory limit) then Option A |
-| nexons reports almost no hits | Contig naming mismatch (`19` vs `chr19`) between GTF and FASTA |
-| Mapped fraction far below 90% | Expected against a subset reference; otherwise check the basecall model matches the chemistry |
-| nexons' `secondary` bucket is always 0 | `SECONDARY=no` (the default) suppressed them. Set `SECONDARY=yes` |
-| `gzip: not in gzip format` | The file is plain FASTQ under a `.gz` name. Harmless; rename it |
+[`fastq_to_bam.sh.old`](fastq_to_bam.sh.old) is the previous script. It retains
+`BENCHMARK=<n>` and `JUNC_BED`, which the current lean script drops.
