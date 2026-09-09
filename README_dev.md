@@ -14,7 +14,7 @@ Nexxons is a command-line Python application used for the quantification and qua
 Input: Starts from BAM files of aligned long-read RNA-Seq.
 Provide GTP file (Works best with Ensembl GTF)
 
-![img](/images/nexons_cli.png)
+![img](/images/nexons_cli.png)l
 
 > When Oxford NAnopore devices sequence full-length RNA molecules, they generate raw sequence reads. Scientist align these reads to a reference genome to create a alignment file (a BAM file)*. Nexons takes that BAM file alongside a gene reference file (GTF) to perform 2 critical tasks:
 > - **Transcript and Gene Quantification**: IT counts how many times each specific RAN transcript or gene appears in your sample. Ir accounts for the slight per-base inaccuracies that can happen in long-read sequencing using flexible matching for splice sites and transcript ends. And it outputs 3 tables:

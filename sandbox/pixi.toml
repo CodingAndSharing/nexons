@@ -25,3 +25,14 @@ matplotlib = ">=3.11.1,<4"
 plotly = ">=6,<7"
 kaleido = "0.2.1.*"
 streamlit = ">=1.40"
+
+# --- fastq_to_bam (ONT cDNA alignment) ----------------------------------
+# minimap2 2.28+ is wanted for the -x splice improvements to long-read
+# spliced alignment; samtools supplies sort/index/flagstat. seqkit is only
+# used for read-length and read-count summaries, so it is safe to drop.
+# pigz lets you recompress the FASTQ in parallel -- the FTP copy arrives
+# uncompressed despite its .fastq.gz name.
+minimap2 = ">=2.28"
+samtools = ">=1.20"
+seqkit = ">=2.8"
+pigz = ">=2.8"

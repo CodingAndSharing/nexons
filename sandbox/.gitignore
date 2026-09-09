@@ -5,3 +5,16 @@
 # python bytecode
 __pycache__/
 *.pyc
+
+# Sequencing data and alignment products. big_data/ already holds a multi-GB
+# FASTQ; without this rule a plain `git add .` stages it and the push fails
+# (or worse, succeeds). Track the READMEs and scripts, never the reads.
+big_data/*
+!big_data/*.md
+*.bam
+*.bam.bai
+*.mmi
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
