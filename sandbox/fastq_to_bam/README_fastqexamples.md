@@ -178,17 +178,106 @@ It will stop at the first thing that is actually missing. The line
 Mouse GRCm39, Ensembl release 116. Both URLs and sizes below were checked
 against the server.
 
+**Two of the three reference files are downloads; `REF_MMI` is not.** Ensembl
+distributes no minimap2 index — its `dna_index/` directory holds only `.fai`
+and `.gzi` files for samtools. See [the `.mmi`](#the-ref_mmi-index-has-no-download-url)
+below.
+
+### Load `.env` into your shell first
+
+So that `curl` writes to exactly the paths the script will later read. `$REPO`
+and `$SANDBOX` are normally set by the script, so set them by hand here:
+
+```bash
+cd /path/to/nexons
+set -a; REPO="$PWD"; SANDBOX="$PWD/sandbox"; . ./.env; set +a
+
+# confirm they expanded to absolute paths
+echo "$REF_GTF"
+echo "$REF_MMI"
+mkdir -p "$(dirname "$REF_GTF")"
+```
+
+If those echo blank, the variables are still empty in `.env` — go back to
+Step 3. If they echo a *relative* path, fix that now rather than later.
+
+### Download the genome and the annotation
+
+```bash
+# Annotation for nexons -- 108 MB gzipped
+curl -L --fail -C - -o "$REF_GTF" \
+  https://ftp.ensembl.org/pub/release-116/gtf/mus_musculus/Mus_musculus.GRCm39.116.gtf.gz
+
+# Genome, only needed to BUILD the index in Step 5 -- 806 MB gzipped, ~2.7 Gbase
+curl -L --fail -C - -o "$SANDBOX/big_data/reference/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz" \
+  https://ftp.ensembl.org/pub/release-116/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+```
+
+Three flags earn their place. **`--fail`** makes curl exit non-zero on an HTTP
+error instead of cheerfully writing the server's HTML error page into your
+`.fa.gz` — which you would then discover during the index build. **`-L`**
+follows redirects, which the Ensembl mirror uses. **`-C -`** resumes a partial
+transfer instead of restarting it; on an 806 MB file over a flaky link that is
+the difference between finishing and not.
+
+Use `-o "$VAR"` rather than `-O`, so the file lands where `.env` says it should
+regardless of your current directory. `-O` writes to the *current* directory
+under the URL's filename, which is how references end up scattered.
+
+If you prefer no shell variables, the plain equivalent is:
+
 ```bash
 cd sandbox/big_data/reference
-
-# Genome, 806 MB gzipped, ~2.7 Gbase
-curl -L --fail -O \
-  https://ftp.ensembl.org/pub/release-116/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
-
-# Annotation for nexons, 108 MB gzipped
-curl -L --fail -O \
+curl -L --fail -C - -O \
   https://ftp.ensembl.org/pub/release-116/gtf/mus_musculus/Mus_musculus.GRCm39.116.gtf.gz
 ```
+
+### The `REF_MMI` index has no download URL
+
+`Mus_musculus_GRCm39_2026_04.mmi` is not an Ensembl product and cannot be
+fetched from a public URL — no reference project publishes minimap2 indexes,
+because the file is only valid for one minimap2 index version and one preset.
+You have two ways to get it.
+
+**Build it** from the genome you just downloaded — [Step 5](#step-5-recommended--build-the-minimap2-index).
+This is the normal path and takes minutes, not hours.
+
+**Or copy it** if a collaborator built it. Whatever the source, write it
+straight to `$REF_MMI`:
+
+```bash
+# From an internal HTTP(S) server. Substitute your own host and path.
+curl -L --fail -C - -o "$REF_MMI" \
+  "https://internal.example.org/references/Mus_musculus_GRCm39_2026_04.mmi"
+
+# From a machine you have SSH access to -- usually the better option for
+# a multi-GB file, since it resumes and shows progress:
+rsync -avP user@host:/path/to/Mus_musculus_GRCm39_2026_04.mmi "$REF_MMI"
+```
+
+Then check it before trusting it, because a truncated index fails in a way
+that looks like a data problem rather than a transfer problem:
+
+```bash
+ls -lh "$REF_MMI"        # against the size Step 0 predicted
+sha256sum "$REF_MMI"     # compare with whoever sent it
+
+# Load the index and align nothing: a cheap validity test
+cd sandbox
+pixi run minimap2 "$REF_MMI" /dev/null 2>&1 | head -5
+```
+
+That last command loads the index and aligns nothing. It is the cheapest real
+test that the file is a valid `.mmi` — but note it loads the whole index into
+RAM, so it is also a live check of Step 0's arithmetic. If it prints
+`Killed`, the index does not fit on this machine.
+
+Watch for a `[WARNING] Indexing parameters (-k, -w or -H) overridden by
+parameters used in the prebuilt index` line whenever you use a downloaded
+`.mmi`. That means it was built with a different preset than `-x splice`, and
+minimap2 is silently ignoring your preset in favour of the index's own `k`
+and `w`. An index built for `-x map-ont` will align, but with quietly worse
+sensitivity on short exons.
 
 Use **`primary_assembly`**, not `toplevel`. `toplevel` additionally contains
 haplotype and patch scaffolds, which give many reads a second near-identical
@@ -201,9 +290,24 @@ and you discover it during the index build.
 Verify before going further:
 
 ```bash
-ls -lh
-gzip -t Mus_musculus.GRCm39.dna.primary_assembly.fa.gz && echo "genome OK"
-gzip -t Mus_musculus.GRCm39.116.gtf.gz && echo "gtf OK"
+ls -lh "$(dirname "$REF_GTF")"
+
+# complete and not an HTML error page
+gzip -t "$REF_GTF" && echo "gtf OK"
+gzip -t "$SANDBOX/big_data/reference/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz" \
+  && echo "genome OK"
+
+# the GTF states its own assembly -- this must read GRCm39
+zcat "$REF_GTF" | head -3
+```
+
+That last check is the direct test of the requirement below, and it costs a
+second:
+
+```
+#!genome-build GRCm39
+#!genome-version GRCm39
+#!genome-date 2020-06
 ```
 
 Two consistency requirements. The **assembly must match** — a GRCm39 GTF
