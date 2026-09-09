@@ -63,4 +63,7 @@ A gene level count table including all hits where a read matches part of a trans
 ## ```nexons_output_[filename]_qc.html```
 An HTML QC report summarising the matches found in each file
 
+## Contribute
+
+If you are a developer and want to contribute, please use the "Issues" or read the documentation in `/dev` folder.
 
