@@ -15,17 +15,6 @@ ipykernel = ">=7.3.0,<8"
 pandas = ">=3.0.5,<4"
 matplotlib = ">=3.11.1,<4"
 
-# --- viz_scripts (nexons_viz + Streamlit app) ---------------------------
-# plotly is pinned to 6.x deliberately. plotly 7 delegates static image
-# export to kaleido >=1, which downloads and drives a headless Chrome at
-# first use; on a machine without that download the PNG export fails while
-# the HTML still works. plotly 6 with kaleido 0.2.1 ships its own renderer
-# and exports PNGs offline. Drop both pins once a browser-free export path
-# is available.
-plotly = ">=6,<7"
-kaleido = "0.2.1.*"
-streamlit = ">=1.40"
-
 # --- fastq_to_bam (ONT cDNA alignment) ----------------------------------
 # minimap2 2.28+ is wanted for the -x splice improvements to long-read
 # spliced alignment; samtools supplies sort/index/flagstat. seqkit is only
@@ -36,3 +25,23 @@ minimap2 = ">=2.28"
 samtools = ">=1.20"
 seqkit = ">=2.8"
 pigz = ">=2.8"
+
+# --- viz_scripts (nexons_viz + Streamlit app) ---------------------------
+# These three are PyPI packages, not conda ones, and they belong here rather
+# than in [dependencies]. conda-forge has no `kaleido` -- it packages the
+# project as `python-kaleido` -- so a conda pin of `kaleido = "0.2.1.*"`
+# fails to solve with "No candidates were found". These are also exactly how
+# the working environment was built: pip installed all three.
+#
+# plotly is held at 6.x deliberately. plotly 7 delegates static image export
+# to kaleido >=1, which downloads and drives a headless Chrome on first use;
+# without that download PNG export fails while the HTML still works. plotly 6
+# with kaleido 0.2.1 ships its own renderer and exports PNGs offline. Drop
+# both pins once a browser-free export path exists.
+#
+# Note the version syntax differs from [dependencies]: PEP 508, so `==0.2.1`,
+# not conda's `0.2.1.*` glob.
+[pypi-dependencies]
+plotly = ">=6,<7"
+kaleido = "==0.2.1"
+streamlit = ">=1.40"
