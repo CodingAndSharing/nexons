@@ -1,6 +1,10 @@
 test_data/*
 nexons_output.txt
 __pycache__
+
+test_data/*
+nexons_output.txt
+__pycache__
 venv
 .claude
 
@@ -156,17 +160,8 @@ activemq-data/
 *.sage.py
 
 # Environments
-# `.env` alone leaves .env.local, .env.backup, .env.save and editor
-# leftovers like .env~ trackable, which is how credentials usually escape.
-# Ignore every variant, then re-admit only the value-free template.
 .env
-.env.*
-.env~
-!.env.example
 .envrc
-# Netrc / credential helpers, in case one is ever placed in the repo
-.netrc
-_netrc
 .venv
 env/
 venv/
@@ -237,4 +232,5 @@ __marimo__/
 # sandbox data not to create
 sandbox/data/input
 sandbox/data/output
-sandbox/big_data/*
+
+**.pixi**
