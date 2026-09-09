@@ -37,7 +37,15 @@ def main():
     # Process each of the BAM files and add their data to the quantitations
     for count,bam_file in enumerate(options.bam):
         log(f"Quantitating {bam_file} ({count+1} of {len(options.bam)})")
-        read_lengths,outcomes,quantitations,endflex_observations,innerflex_observations,coverage = process_bam_file(genes_transcripts_exons, gene_index, bam_file, options.direction, options.flex, options.endflex)
+
+        annotated_bam = None
+        if options.annotated_bam is not None:
+            annotated_dir = Path(options.annotated_bam)
+            if not annotated_dir.is_dir():
+                raise Exception(f"--annotated-bam directory '{options.annotated_bam}' doesn't exist - please create it first")
+            annotated_bam = str(annotated_dir / (Path(bam_file).stem + ".annotated.bam"))
+
+        read_lengths,outcomes,quantitations,endflex_observations,innerflex_observations,coverage = process_bam_file(genes_transcripts_exons, gene_index, bam_file, options.direction, options.flex, options.endflex, annotated_bam)
 
         results.append(quantitations)
 
@@ -282,7 +290,7 @@ def debug (message):
         print("DEBUG:",message, file=sys.stderr)
 
 
-def process_bam_file(genes, index, bam_file, direction, flex, endflex):
+def process_bam_file(genes, index, bam_file, direction, flex, endflex, annotated_bam=None):
     counts = {
         "unique":{},
         "partial":{},
@@ -325,6 +333,45 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
 
     samfile = pysam.AlignmentFile(bam_file, "rb")
 
+    # Optionally we write the reads back out again, tagged with the decision we
+    # made about each one, so that downstream tools can show the user which
+    # reads produced which counts.  We use the X? tag space which the SAM
+    # specification reserves for local use.
+    #
+    #   XC Z  classification: unmapped, secondary, no_gene, no_hit, gene,
+    #                         multi_gene, partial or unique
+    #   XT Z  the transcript this read was assigned to ('.' if none)
+    #   XG Z  the gene this read was assigned to, comma joined for multi_gene
+    #         ('.' if none)
+    #   XD A  S or O for a same/opposing strand call, '.' where nexons didn't
+    #         make a directionality call for this read
+    #   XF i  how many exon boundaries only matched within the flex tolerance
+    #         (-1 where no transcript match was attempted)
+    #
+    # Every read in the input is written out exactly once, including unmapped
+    # and secondary reads, so the annotated file is a faithful superset of the
+    # input rather than a filtered version of it.
+
+    annotated_out = None
+    if annotated_bam is not None:
+        annotated_out = pysam.AlignmentFile(annotated_bam, "wb", template=samfile)
+
+    def annotate(read, classification, transcript_id=None, gene_id=None, strand_call=None, flex_count=-1):
+        if annotated_out is None:
+            return
+        read.set_tag("XC", classification, value_type="Z")
+        read.set_tag("XT", transcript_id if transcript_id else ".", value_type="Z")
+        read.set_tag("XG", gene_id if gene_id else ".", value_type="Z")
+        read.set_tag("XD", strand_call if strand_call else ".", value_type="A")
+        read.set_tag("XF", int(flex_count), value_type="i")
+        annotated_out.write(read)
+
+    def strand_call_for(read, gene_id):
+        # Must match the Same_Strand_Hit / Opposing_Strand_Hit logic below
+        if read.is_reverse == (genes[gene_id]["strand"] == "-"):
+            return "S"
+        return "O"
+
     for read in samfile.fetch(until_eof=True):
 
         outcomes["Total_Reads"] += 1
@@ -332,11 +379,13 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         if read.is_unmapped:
             # Nothing to see here
             outcomes["No_Alignment"] += 1
+            annotate(read, "unmapped")
             continue
 
         if read.is_secondary:
             # This isn't the primary alignment
             outcomes["Secondary_Alignment"] += 1
+            annotate(read, "secondary")
             continue
 
         outcomes["Primary_Alignment"] += 1
@@ -351,6 +400,7 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         if not read.reference_name in index:
             # There are no features on this chromsome
             outcomes["No_Gene"] += 1
+            annotate(read, "no_gene")
             continue
 
 
@@ -383,7 +433,12 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
 
         if not possible_genes:
             outcomes["No_Gene"] += 1
+            annotate(read, "no_gene")
             continue
+
+        # Every gene which produced any kind of match, so that a multi_gene
+        # read can report what it was ambiguous between
+        matched_gene_ids = []
 
         found_hit = False
         found_gene_id = None
@@ -401,6 +456,9 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
             # unique, partial, multi 
 
             transcript_id,status,observed_endflex, observed_innerflex, start_percent, end_percent = gene_matches(exons,genes[gene_id],flex,endflex)
+
+            if transcript_id is not None or status == "intron":
+                matched_gene_ids.append(gene_id)
 
             if transcript_id is not None:
 
@@ -475,6 +533,7 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         # Now we can increase the appropriate counts
         if not found_hit and found_status is None:
             outcomes["No_Hit"] += 1
+            annotate(read, "no_hit")
 
         elif not found_hit and status == "intron":
             # We have only a gene level hit
@@ -484,9 +543,11 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
             else:
                 counts["gene"][found_gene_id] += 1
 
+            annotate(read, "gene", gene_id=found_gene_id)
 
         elif found_status == "multi":
             outcomes["Multi_Gene"] += 1
+            annotate(read, "multi_gene", gene_id=",".join(matched_gene_ids))
 
         else:
             # There is a hit
@@ -547,6 +608,29 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
                 else:
                     counts["unique"][(found_gene_id,found_transcript_id)] += 1
 
+            # found_status here is unique, partial or gene.  Only the first two
+            # resolve to a transcript - a "gene" status means the read was
+            # compatible with more than one transcript of this same gene.
+            annotate(
+                read,
+                found_status,
+                transcript_id = found_transcript_id if found_status in ("unique","partial") else None,
+                gene_id = found_gene_id,
+                strand_call = strand_call_for(read, found_gene_id),
+                flex_count = len([i for i in best_endflex if i != 0]) + len([i for i in best_innerflex if i != 0])
+            )
+
+
+    if annotated_out is not None:
+        annotated_out.close()
+        # We wrote the reads in the order we read them, so a coordinate sorted
+        # input stays coordinate sorted and can be indexed directly.
+        try:
+            pysam.index(annotated_bam)
+        except Exception as ex:
+            warn(f"Couldn't index {annotated_bam} ({ex}) - is the input BAM coordinate sorted?")
+
+        log(f"Wrote annotated reads to {annotated_bam}")
 
     # Our read lengths often have high outliers which skew the overall distribution.
     # I'll go through the data until we've hit 5 empty slots - everything above that
@@ -1138,6 +1222,12 @@ def get_options():
         "--outbase","-o",
         help="The basename for the output count tables. All outputs will start with this prefix",
         default="./nexons_output"
+    )
+
+    parser.add_argument(
+        "--annotated-bam","-a",
+        help="Write each input BAM back out with per-read classification tags (XC/XT/XG/XD/XF). The value is a directory, which must already exist, and each output is named after its input BAM with a .annotated.bam suffix",
+        default=None
     )
 
     parser.add_argument(
