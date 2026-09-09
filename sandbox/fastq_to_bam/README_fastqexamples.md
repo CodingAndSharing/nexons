@@ -7,6 +7,37 @@ The pipeline is one script, [`fastq_to_bam.sh`](fastq_to_bam.sh); this file
 explains what it does, what to set before running it, and how long to expect it
 to take on a 16-core / 8 GB laptop.
 
+## Or run it as a notebook
+
+[`fastq_to_bam_examples.ipynb`](fastq_to_bam_examples.ipynb) walks the same
+pipeline stage by stage, with the preflight checks, the read-length and
+alignment-QC plots, and a throughput measurement that extrapolates to your full
+run. Open it with the **Python (nexons pixi)** kernel:
+
+```bash
+cd sandbox
+pixi install                      # once
+pixi run jupyter lab fastq_to_bam/fastq_to_bam_examples.ipynb
+```
+
+It is cheap by default — a 50,000-read subsample, about a minute end to end —
+and every long stage is gated behind an explicit flag, so nothing starts a
+multi-hour job unless you ask. It also degrades rather than failing if
+`minimap2` is not installed yet, so it is safe to run before `pixi install`
+finishes.
+
+The notebook is a **build product** of
+[`build_fastq_notebook.py`](build_fastq_notebook.py) — prose and code stay in
+one reviewable diff, and a notebook broken by a bad merge can be regenerated:
+
+```bash
+pixi run python fastq_to_bam/build_fastq_notebook.py
+```
+
+Edit the builder, not the `.ipynb`. And **clear the outputs before committing**
+(`Kernel → Restart Kernel and Clear All Outputs`) — executed cells store their
+output inside the file.
+
 ---
 
 ## The dataset this was written against
@@ -310,10 +341,92 @@ trade.
 
 ### Option C — whole genome, bigger machine
 
-The clean answer if you need genome-wide alignment with trustworthy MAPQ:
-build the index once somewhere with ≥32 GB RAM, then copy the `.mmi` back.
-Aligning against a prebuilt index still needs the whole index resident, so this
-only helps if the target machine also does the alignment.
+The clean answer if you need genome-wide alignment with trustworthy MAPQ.
+Aligning against a prebuilt index still needs the whole index resident, so
+building the `.mmi` elsewhere and copying it back does **not** help — the
+bigger machine has to do the alignment too. Everything below therefore runs on
+that machine, not on the laptop.
+
+Nothing about the pipeline changes. You point `REF_FASTA` at the whole genome
+instead of chromosome 19 and run the same script; it builds the index on first
+invocation and reuses it afterwards.
+
+**1. Get the reference.** Use `primary_assembly`, *not* `toplevel`:
+
+```bash
+cd sandbox/big_data
+curl -L --fail -O https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+```
+
+`toplevel` also contains haplotype and patch scaffolds. They inflate the index
+and, worse, give reads a second near-identical place to map, which collapses
+MAPQ and quietly changes what nexons counts. `primary_assembly` is the one you
+want. minimap2 reads gzipped FASTA directly, so leave it compressed.
+
+**2. Build the index** (the memory-hungry step, ~10–20 min):
+
+```bash
+pixi run minimap2 -x splice -t 16 \
+  -d Homo_sapiens.GRCh38.dna.primary_assembly.splice.mmi \
+     Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+```
+
+`-x splice` matters: it sets `k=15, w=5`, and those values are baked into the
+`.mmi`. An index built under a different preset is silently used with *its*
+k/w, not the one you ask for at alignment time. Do **not** add `-I 1G` here —
+that splits the index and forces `--split-prefix` at alignment time, which is
+Option B. At the default `-I 4G` the 3.1 Gbase genome indexes as a single
+batch, which is what you want.
+
+You can skip this step and let the script do it — it runs exactly this command
+when `REF_MMI` is unset. Doing it by hand just separates the one failure you
+care about from a four-hour pipeline run.
+
+**3. Run the pipeline:**
+
+```bash
+cd sandbox
+REF_MMI=big_data/Homo_sapiens.GRCh38.dna.primary_assembly.splice.mmi \
+FASTQ_DIR=big_data \
+BAM_DIR=big_data/bam \
+THREADS=16 SORT_THREADS=4 SORT_MEM=1G \
+TMPDIR=big_data/tmp \
+  ./fastq_to_bam/fastq_to_bam.sh
+```
+
+Set these in `.env` instead if you prefer; the script reads them from there.
+
+**Budget the RAM, don't just scale it.** The index stays resident for the whole
+alignment, and `samtools sort` runs *concurrently* with it off the same pipe,
+using roughly `SORT_THREADS × SORT_MEM`. So more cores does not mean you should
+raise the sort allocation:
+
+| Machine | `THREADS` | `SORT_THREADS` × `SORT_MEM` | Rough peak |
+|---|---|---|---|
+| 32 GB / 16 core | 16 | 4 × 768M (≈3 GiB) | ~22 GiB |
+| 64 GB / 32 core | 32 | 8 × 2G (≈16 GiB) | ~36 GiB |
+
+On a 32 GB machine keep the sort small — the index is the tenant that cannot be
+evicted. `TMPDIR` must be on a real disk with ~2× the BAM size free, and it
+must not be a tmpfs; the script checks both and aborts up front.
+
+The index sizes and peaks above are **estimates, not measurements** — I had no
+minimap2 binary to measure them. minimap2's own figure for a default human
+index is ~11 GiB peak; `-x splice` uses `w=5` instead of `w=10`, which roughly
+doubles the minimizer count, hence ≥32 GB rather than 16. Confirm with
+`/usr/bin/time -v` on the index build before planning a long run around it.
+
+**4. Sanity-check that it was worth it.** The point of the whole genome is
+reads that chr19 had nowhere to put, so measure that:
+
+```bash
+pixi run samtools idxstats big_data/bam/<sample>.bam \
+  | awk '{m+=$3} END {printf "mapped: %d\n", m}'
+pixi run samtools view -c -f 4 big_data/bam/<sample>.bam   # still unmapped
+```
+
+If the mapped count is within a percent or two of your chr19 run for the genes
+in your GTF, Option A was sufficient and you can go back to it.
 
 ### Option D — raise the WSL memory limit
 

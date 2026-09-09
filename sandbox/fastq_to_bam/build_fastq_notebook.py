@@ -284,6 +284,7 @@ def smart_open(path):
 def _read_at_boundary(fh):
     # Resynchronise to the next FASTQ record: an '@' line whose +2 line is '+'.
     # A quality line can also start with '@', hence the check.
+    # Returns (sequence_length, bytes_the_whole_record_occupies).
     while True:
         l1 = fh.readline()
         if not l1:
@@ -295,31 +296,40 @@ def _read_at_boundary(fh):
         if not l3:
             return None
         if l3.startswith("+"):
-            return len(l2.rstrip())
+            l4 = fh.readline()
+            if not l4:
+                return None
+            return len(l2.rstrip()), len(l1) + len(l2) + len(l3) + len(l4)
 
 def sample_lengths(path, n=20_000, seed=0):
     # Random-offset sampling for plain files; sequential head for gzipped ones
     # (a gzip stream cannot be seeked into cheaply).
+    # Returns (sequence_lengths, mean_bytes_per_record, method).
     size = path.stat().st_size
     if is_gzip(path):
-        lens = []
+        lens, nbytes = [], 0
         with smart_open(path) as fh:
+            buf = []
             for i, line in enumerate(fh):
-                if i % 4 == 1:
-                    lens.append(len(line.rstrip()))
-                if len(lens) >= n:
-                    break
-        return lens, "head (gzipped: cannot seek)"
+                buf.append(line)
+                if i % 4 == 3:
+                    lens.append(len(buf[1].rstrip()))
+                    nbytes += sum(len(x) for x in buf)
+                    buf = []
+                    if len(lens) >= n:
+                        break
+        return lens, nbytes / max(len(lens), 1), "head (gzipped: cannot seek)"
     rng = random.Random(seed)
-    lens = []
+    lens, nbytes = [], 0
     with open(path, "rt", errors="replace") as fh:
         for _ in range(n):
-            fh.seek(rng.randrange(0, max(size - 4096, 1)))
+            fh.seek(rng.randrange(0, max(size - 8192, 1)))
             fh.readline()                     # discard partial line
-            L = _read_at_boundary(fh)
-            if L:
-                lens.append(L)
-    return lens, "random offsets"
+            rec = _read_at_boundary(fh)
+            if rec:
+                lens.append(rec[0])
+                nbytes += rec[1]
+    return lens, nbytes / max(len(lens), 1), "random offsets"
 
 fastqs = sorted(p for p in BIG.iterdir()
                 if p.is_file() and re.search(r"\.(fastq|fq)(\.gz)?(\.part)?$", p.name))
@@ -333,16 +343,23 @@ else:
     target = max(fastqs, key=lambda p: p.stat().st_size)
     print(f"\nsampling read lengths from {target.name}")
     t0 = time.time()
-    lens, how = sample_lengths(target, n=20_000)
+    lens, rec_bytes, how = sample_lengths(target, n=20_000)
     import statistics as st
+    size = target.stat().st_size
+    # Read count from measured bytes-per-record, not from read length alone.
+    # A FASTQ record spends about two bytes per base -- the sequence and its
+    # quality string -- plus a header, which for ONT carries the run and
+    # basecall-model tags and is not negligible. Dividing the file size by one
+    # read length overestimates the count roughly twofold.
+    est_reads = size / rec_bytes
     print(f"  method       {how}")
     print(f"  reads seen   {len(lens):,} in {time.time()-t0:.1f}s")
     print(f"  mean         {st.mean(lens):,.0f} bp")
-    print(f"  median       {st.median(lens):,.0f} bp")
+    print(f"  median       {st.median(lens):,.0f} bp   (mean > median: right-skewed, as expected)")
     print(f"  range        {min(lens):,} - {max(lens):,} bp")
-    bytes_per_read = target.stat().st_size / max(len(lens), 1)  # placeholder, refined below
-    est_reads = target.stat().st_size / (st.mean(lens) + 2 * 60 + 4)  # seq+qual+headers
+    print(f"  bytes/record {rec_bytes:,.0f}  ({rec_bytes/st.mean(lens):.2f} per base)")
     print(f"  est. reads   {est_reads:,.0f}  (~{est_reads*st.mean(lens)/1e9:.2f} Gbase)")
+    print(f"  -> estimates, from {len(lens):,} sampled records; exact counts need seqkit stats")
     if target.name.endswith(".part"):
         print("\n  NOTE: this file is still an unfinished transfer. Fine for the")
         print("  worked example below; never use it for real quantification.")
@@ -503,7 +520,13 @@ if SUB and REF and all(tools[t] for t in ("minimap2", "samtools")):
     m = re.search(r"throughput:\s*([\d.]+)\s*Mbase/s", out)
     if m:
         mbs = float(m.group(1))
-        gbase_per_barcode = 4.17          # measured for barcode01
+        # Prefer the figure measured from this run's own input over a constant.
+        try:
+            gbase_per_barcode = est_reads * st.mean(lens) / 1e9
+            basis = f"{gbase_per_barcode:.2f} Gbase, estimated from {target.name[:28]}"
+        except NameError:
+            gbase_per_barcode = 4.17
+            basis = "4.17 Gbase, measured on barcode01"
         n_barcodes = max(len(fastqs), 1)
         per_bc = gbase_per_barcode * 1000 / mbs / 60      # minutes
         print(f"\n{'':<26}{'align':>9}{'+sort/index':>13}{'total':>9}")
@@ -512,7 +535,9 @@ if SUB and REF and all(tools[t] for t in ("minimap2", "samtools")):
             a = per_bc * n
             print(f"{label:<26}{a:8.0f}m{a*0.15:12.0f}m{a*1.15:8.0f}m")
         print(f"\nmeasured {mbs:.2f} Mbase/s against {REF.name}")
-        print("Scaled from 4.17 Gbase per barcode (measured on barcode01).")
+        print(f"Scaled from {basis}.")
+        print("Add the download to this if transfers are still running; the two")
+        print("overlap, so finished barcodes can align while the rest arrive.")
     else:
         print("\nCould not parse a throughput line from the benchmark output.")
 else:

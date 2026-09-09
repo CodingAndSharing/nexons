@@ -69,8 +69,27 @@ done
     echo "ERROR: set REF_FASTA (reference genome) or REF_MMI (prebuilt index) in .env" >&2
     exit 1
 }
+# REF_FASTA is the genome you align TO. Putting reads there is an easy mistake
+# to make and the resulting error ("does not exist") does not hint at the cause,
+# so name it explicitly.
+case "${REF_FASTA,,}" in
+    *.fastq|*.fastq.gz|*.fq|*.fq.gz|*.fastq.gz.part)
+        echo "ERROR: REF_FASTA looks like sequencing reads, not a reference genome:" >&2
+        echo "         $REF_FASTA" >&2
+        echo "  REF_FASTA is the genome you align TO -- a .fa/.fasta, e.g." >&2
+        echo "         REF_FASTA=$SANDBOX/big_data/Homo_sapiens.GRCh38.dna.chromosome.19.fa" >&2
+        echo "  Your reads are not set with a variable. Either pass them as arguments:" >&2
+        echo "         pixi run ./fastq_to_bam/fastq_to_bam.sh reads.fastq.gz" >&2
+        echo "  or point FASTQ_DIR at the directory holding them (default:" >&2
+        echo "         $FASTQ_DIR)." >&2
+        exit 1
+        ;;
+esac
 if [[ -n "$REF_FASTA" && ! -f "$REF_FASTA" ]]; then
-    echo "ERROR: REF_FASTA=$REF_FASTA does not exist" >&2; exit 1
+    echo "ERROR: REF_FASTA=$REF_FASTA does not exist" >&2
+    echo "  Paths in .env are not resolved relative to .env -- a bare filename is" >&2
+    echo "  looked up in your current directory. Use an absolute path." >&2
+    exit 1
 fi
 
 # Collect the inputs.
