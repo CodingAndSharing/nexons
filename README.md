@@ -23,6 +23,13 @@ nexons.py [gtf_file] [bam1] [bam2]...
 
 This will quantitate the bam files into output files starting with ```nexons_output```
 
+Use `--parallel 4` to process up to four BAM files concurrently (default: 1).
+Each file is analysed in its own worker process using the existing analysis.
+Per-file reports and aggregated tables are written as usual, with aggregate
+columns retaining the input BAM order. Input BAMs must have distinct basenames
+when using parallel processing, because output names are based on those names.
+Each worker holds annotation data, so higher concurrency uses more memory.
+
 ## Additional options
 
 ```
@@ -62,5 +69,4 @@ A gene level count table including all hits where a read matches part of a trans
 
 ## ```nexons_output_[filename]_qc.html```
 An HTML QC report summarising the matches found in each file
-
 
