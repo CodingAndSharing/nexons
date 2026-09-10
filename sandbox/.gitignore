@@ -18,3 +18,5 @@ big_data/*
 *.fastq.gz
 *.fq
 *.fq.gz
+
+archived

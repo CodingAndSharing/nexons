@@ -1,81 +1,81 @@
 # FASTQ → BAM for nexons — step by step
 
-Turning Oxford Nanopore cDNA reads into the coordinate-sorted, indexed BAM that
-`nexons.py` expects, on mouse GRCm39.
+# Table of contents
+0. [Goal](#goal)
+1. [Step 1](#step-1)
+2. [Step 2](#step-2)
+3. [Step 3](#step-3)
+4. [Step 4](#step-4)
+5. [Step 5](#step-5)
+6. [Step 6](#step-6)
+5. [Step 7](#step-7)
+6. [Step 8](#step-8)
 
-Follow the **RECOMMENDED** steps in order. Each one ends in something you can
-check, so a failure is caught at the step that caused it rather than an hour
-later. Every parameter of the alignment command itself is explained separately
-in [`COMMAND_EXPLAINED.md`](COMMAND_EXPLAINED.md).
 
-## What you end up with
+## Goal 
+Turning Oxford Nanopore cDNA reads into the coordinate-sorted, indexed BAM that `nexons.py` expects, for this example, on mouse GRCm39.
+
+> [!NOTE]
+> Follow the **RECOMMENDED** steps in order. Each one ends in something you can check, so a failure is caught at the step that caused it rather than an hour later. Every parameter of the alignment command itself is explained separately in [`COMMAND_EXPLAINED.md`](COMMAND_EXPLAINED.md).
+
+**What you end up with**
 
 ```
 sandbox/big_data/
-├── input/                  ← your FASTQ reads go here
+├── input/                  # your FASTQ reads go here (the ones from lab 🧪)
 │   ├── PBM75668_pass_L001_barcode01.fastq.gz
 │   └── PBM75668_pass_L001_barcode02.fastq.gz
-├── reference/              ← genome, annotation, minimap2 index
+├── reference/              # genome, annotation, minimap2 index 💾
 │   ├── Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
 │   ├── Mus_musculus.GRCm39.116.gtf.gz
 │   └── Mus_musculus_GRCm39_2026_04.mmi
-├── outputs/                ← BAMs land here
+├── outputs/                # Output BAM files land here  🎯
 │   ├── PBM75668_pass_L001_barcode01.bam
 │   └── PBM75668_pass_L001_barcode01.bam.bai
-└── tmp/                    ← samtools sort scratch
+└── tmp/                    # samtools sort scratch (e.g: sort.PBM75668_pass_L001_barcode01.0000.bam, sort.PBM75668_pass_L001_barcode01.0001.bam, ...)
 ```
 
-Nothing under `big_data/` is version-controlled — it is excluded by
-`sandbox/.gitignore`, which is deliberate: a single barcode here is ~9 GB.
+
+> [!IMPORTANT]
+>  NOTE: Nothing under `big_data/` is version-controlled — it is excluded by
+`sandbox/.gitignore`
+
 
 ---
 
-## Step 0 (RECOMMENDED) — check it will fit before downloading anything
+## Step 1
+**Check these task and data will fit in your computer (before downloading anything)**
 
 **Do this first.** minimap2 holds the entire index in RAM for the whole run. If
 it does not fit, the kernel kills the process with no message beyond `Killed`,
 after you have already spent an hour on the download and the index build.
 
 ```bash
-free -g              # total and available RAM
-nproc                # cores
-df -h .              # free disk on the data volume
+free -g              # total and available RAM: 64GB ideally
+nproc                # cores : min 8
+df -h .              # free disk on the data volume: min 50GB
 ```
 
-This machine reports **~7.6 GiB total, ~5 GiB available, 16 cores**.
+_This machine reports **~7.6 GiB total, ~5 GiB available, 16 cores**._ ❌
 
-The arithmetic for a whole-genome mouse splice index:
+_You will need more memory RAM and dsk space. Cores seems right.  ✅_
 
-| Quantity | Value | Where it comes from |
-|---|---|---|
-| Genome size | ~2.7 Gbase | GRCm39 primary assembly |
-| Minimizer window (`-x splice`) | `w=5` | Denser than the `w=10` of genomic presets |
-| Minimizers stored | ~900 M | ≈ 2 × 2.7e9 / (w+1) |
-| Hash table | ~7 GiB | ~8 bytes per minimizer |
-| Packed sequence | ~0.7 GiB | 2 bits per base |
-| **Resident total** | **~8 GiB** | plus ~1 GiB working memory |
+> [!NOTE]
+> The arithmetic for a whole-genome mouse splice index:
+> | Quantity | Value | Where it comes from |
+> |---|---|---|
+> | Genome size | ~2.7 Gbase | GRCm39 primary assembly |
+> | Minimizer window (`-x splice`) | `w=5` | Denser than the `w=10` of genomic presets |
+> | Minimizers stored | ~900 M | ≈ 2 × 2.7e9 / (w+1) |
+> | Hash table | ~7 GiB | ~8 bytes per minimizer |
+> | Packed sequence | ~0.7 GiB | 2 bits per base |
+> | **Resident total** | **~8 GiB** | plus ~1 GiB working memory |
 
-**That does not fit in 5 GiB available**, and the *build* peaks higher still.
-So on this laptop as configured, pick one:
 
-- **Raise the memory ceiling** — see [Appendix: more
-  memory](#appendix-more-memory). This is WSL2, so the 7.6 GiB is an
-  allocation, not the hardware. If the laptop physically has 16 or 32 GB this
-  is a one-line config change and the whole-genome path opens up. **Check this
-  before accepting the constraint.**
-- **Use a subset reference** — index only the chromosomes your GTF covers.
-  Covered at [Step 5b](#step-5b-alternative--subset-reference).
-- **Align on a bigger machine.** The index cannot be built elsewhere and
-  copied back: it has to be resident *during* alignment, so the machine that
-  holds it must also do the aligning.
 
-These estimates are arithmetic, not measurements — minimap2 has never been run
-in this environment. Measure with `/usr/bin/time -v` on the index build and
-trust that over the table above.
+## Step 2 
 
----
-
-## Step 1 (RECOMMENDED) — install the tools
+Install the tools
 
 ```bash
 cd sandbox
@@ -102,7 +102,9 @@ changes results.
 
 ---
 
-## Step 2 (RECOMMENDED) — create the folder layout
+## Step 3
+
+create the folder layout
 
 ```bash
 cd sandbox/big_data
@@ -111,7 +113,8 @@ mkdir -p input outputs reference tmp
 
 ---
 
-## Step 3 (RECOMMENDED) — set the environment variables
+## Step 4
+set the environment variables
 
 The script reads `$REPO/.env` — the repo root, *not* the sandbox. Start from
 the template:
@@ -165,7 +168,7 @@ Check it loads:
 
 ```bash
 cd sandbox
-pixi run ./fastq_to_bam/fastq_to_bam.sh
+pixi run ./fastq_to_bam/fastq_to_bam.sh # if this fails because the .mmi has not been created, go to step 4 and 5 and later run it again. 
 ```
 
 It will stop at the first thing that is actually missing. The line
@@ -173,7 +176,9 @@ It will stop at the first thing that is actually missing. The line
 
 ---
 
-## Step 4 (RECOMMENDED) — download the reference
+## Step 5
+
+download the reference
 
 Mouse GRCm39, Ensembl release 116. Both URLs and sizes below were checked
 against the server.
@@ -223,105 +228,12 @@ the difference between finishing and not.
 Use `-o "$VAR"` rather than `-O`, so the file lands where `.env` says it should
 regardless of your current directory. `-O` writes to the *current* directory
 under the URL's filename, which is how references end up scattered.
-
-If you prefer no shell variables, the plain equivalent is:
-
-```bash
-cd sandbox/big_data/reference
-curl -L --fail -C - -O \
-  https://ftp.ensembl.org/pub/release-116/gtf/mus_musculus/Mus_musculus.GRCm39.116.gtf.gz
-```
-
-### The `REF_MMI` index has no download URL
-
-`Mus_musculus_GRCm39_2026_04.mmi` is not an Ensembl product and cannot be
-fetched from a public URL — no reference project publishes minimap2 indexes,
-because the file is only valid for one minimap2 index version and one preset.
-You have two ways to get it.
-
-**Build it** from the genome you just downloaded — [Step 5](#step-5-recommended--build-the-minimap2-index).
-This is the normal path and takes minutes, not hours.
-
-**Or copy it** if a collaborator built it. Whatever the source, write it
-straight to `$REF_MMI`:
-
-```bash
-# From an internal HTTP(S) server. Substitute your own host and path.
-curl -L --fail -C - -o "$REF_MMI" \
-  "https://internal.example.org/references/Mus_musculus_GRCm39_2026_04.mmi"
-
-# From a machine you have SSH access to -- usually the better option for
-# a multi-GB file, since it resumes and shows progress:
-rsync -avP user@host:/path/to/Mus_musculus_GRCm39_2026_04.mmi "$REF_MMI"
-```
-
-Then check it before trusting it, because a truncated index fails in a way
-that looks like a data problem rather than a transfer problem:
-
-```bash
-ls -lh "$REF_MMI"        # against the size Step 0 predicted
-sha256sum "$REF_MMI"     # compare with whoever sent it
-
-# Load the index and align nothing: a cheap validity test
-cd sandbox
-pixi run minimap2 "$REF_MMI" /dev/null 2>&1 | head -5
-```
-
-That last command loads the index and aligns nothing. It is the cheapest real
-test that the file is a valid `.mmi` — but note it loads the whole index into
-RAM, so it is also a live check of Step 0's arithmetic. If it prints
-`Killed`, the index does not fit on this machine.
-
-Watch for a `[WARNING] Indexing parameters (-k, -w or -H) overridden by
-parameters used in the prebuilt index` line whenever you use a downloaded
-`.mmi`. That means it was built with a different preset than `-x splice`, and
-minimap2 is silently ignoring your preset in favour of the index's own `k`
-and `w`. An index built for `-x map-ont` will align, but with quietly worse
-sensitivity on short exons.
-
-Use **`primary_assembly`**, not `toplevel`. `toplevel` additionally contains
-haplotype and patch scaffolds, which give many reads a second near-identical
-place to map: mapping quality collapses toward zero, and what nexons counts
-changes quietly rather than failing.
-
-`--fail` matters. Without it curl writes an HTML error page into the `.fa.gz`
-and you discover it during the index build.
-
-Verify before going further:
-
-```bash
-ls -lh "$(dirname "$REF_GTF")"
-
-# complete and not an HTML error page
-gzip -t "$REF_GTF" && echo "gtf OK"
-gzip -t "$SANDBOX/big_data/reference/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz" \
-  && echo "genome OK"
-
-# the GTF states its own assembly -- this must read GRCm39
-zcat "$REF_GTF" | head -3
-```
-
-That last check is the direct test of the requirement below, and it costs a
-second:
-
-```
-#!genome-build GRCm39
-#!genome-version GRCm39
-#!genome-date 2020-06
-```
-
-Two consistency requirements. The **assembly must match** — a GRCm39 GTF
-against a GRCm38/mm10 genome puts every coordinate in the wrong place without
-erroring. And **chromosome naming must match**: Ensembl uses `1`, `19`, `X`
-where UCSC uses `chr1`, `chr19`, `chrX`. Mixing the conventions is not an
-error; it produces zero counts everywhere. Both files above are Ensembl, so
-they agree with each other.
-
-Do not decompress the genome. minimap2 reads gzip directly.
-
+ 
 ---
 
-## Step 5 (RECOMMENDED) — build the minimap2 index
+## Step 6
+
+**build the minimap2 index (required 64GB RAM)**
 
 Only if you were not handed one. **If a collaborator gave you
 `Mus_musculus_GRCm39_2026_04.mmi`, skip the build but check two things**: its
@@ -350,46 +262,15 @@ Time it and watch the peak, because this is the step most likely to be killed:
 /usr/bin/time -v pixi run minimap2 -x splice -t 16 -d ... 2>&1 | grep -E "Maximum resident|Elapsed"
 ```
 
-### Step 5b (alternative) — subset reference
-
-If Step 0 said the whole genome will not fit and you cannot raise the ceiling,
-index only the chromosomes your GTF actually covers. For a defined gene panel
-this costs nothing in accuracy for those genes.
-
-```bash
-cd sandbox/big_data/reference
-
-# Example: chromosomes 2 and 11 only. Substitute your own.
-for c in 2 11; do
-  curl -L --fail -O \
-    "https://ftp.ensembl.org/pub/release-116/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.chromosome.$c.fa.gz"
-done
-cat Mus_musculus.GRCm39.dna.chromosome.*.fa.gz > GRCm39_subset.fa.gz
-
-cd ../..
-pixi run minimap2 -x splice -t 16 \
-  -d big_data/reference/Mus_musculus_GRCm39_2026_04.subset.mmi \
-     big_data/reference/GRCm39_subset.fa.gz
-```
-
-Concatenating gzip members is valid gzip, so `cat` on `.fa.gz` files works.
-
-Point `REF_MMI` at the `.subset.mmi` and **subset the GTF to the same
-chromosomes**, or nexons will look for genes that are not in the BAM:
-
-```bash
-zcat Mus_musculus.GRCm39.116.gtf.gz \
-  | awk '$1=="2" || $1=="11" || /^#/' \
-  | gzip > GRCm39_subset.116.gtf.gz
-```
-
-Reads whose true origin is outside the subset will either fail to map or
-mis-map onto the included chromosomes. That is acceptable for panel
-quantification and **not** acceptable for anything transcriptome-wide.
 
 ---
 
-## Step 6 (RECOMMENDED) — put the reads in `input/`
+
+## Step 7
+
+**put the reads in `input/` folder**
+
+These readas are downloaded, generated ... whatever, they have to go in the correct folder "input"
 
 ```bash
 mv /wherever/PBM75668_pass_L001_barcode01.fastq.gz sandbox/big_data/input/
@@ -401,8 +282,7 @@ FASTQ is a valid-looking file that is simply missing its tail; minimap2 aligns
 it and exits 0, so the truncation surfaces as missing counts in nexons rather
 than as an error.
 
-Verify each file is complete before aligning. A FASTQ record is exactly four
-lines, so a complete file has a line count divisible by four:
+**Verify** each file is complete before aligning. A FASTQ record is exactly four lines, so a complete file has a line count divisible by four:
 
 ```bash
 cd sandbox/big_data/input
@@ -412,50 +292,23 @@ for f in *.fastq*; do
 done
 ```
 
-This reads the whole file, so it takes a minute or two per barcode. It is worth
-it — it is the difference between a wrong answer and no answer.
+This reads the whole file, so it takes some minutes per barcode. It is worth it — it is the difference between a wrong answer and no answer.
 
-### The two files currently in this repo
-
-Both are still named `.part` and sat unchanged for hours, so the transfers are
-dead rather than slow. Checked by record count:
-
-| File | Reads | Lines mod 4 | Verdict |
-|---|---|---|---|
-| `barcode01` | 3,442,720 | 0 | Complete — usable |
-| `barcode02` | 3,796,680 | **2** | **Truncated mid-record** — re-fetch |
-
-To use barcode01:
-
-```bash
-cd sandbox/big_data
-mv PBM75668_pass_L001_barcode01.2AM3fGSx.fastq.gz.part \
-   input/PBM75668_pass_L001_barcode01.fastq
-```
-
-Note the extension. **Despite the `.gz` in the original name this file is
-plain text, not gzip** — naming it `.fastq.gz` would make `zcat`, `gzip -t` and
-`seqkit` fail on it. (minimap2 itself would cope; it sniffs the format.) Move
-barcode02 out of `input/` until it has been re-fetched.
-
-A record-aligned line count means the file ends on a record boundary. It is
-strong evidence, not proof the run had no further reads — compare against the
-expected yield from the sequencing report if you have it.
 
 ---
 
-## Step 7 (RECOMMENDED) — run the pipeline
+## Step 8 
+
+**TODO run the pipeline (can easily take an hour or more, depending on resources)**
+
+Default both fastq.gz files in the input folder
 
 ```bash
 cd sandbox
 pixi run ./fastq_to_bam/fastq_to_bam.sh
 ```
 
-That aligns every FASTQ in `input/`. For one file:
 
-```bash
-pixi run ./fastq_to_bam/fastq_to_bam.sh big_data/input/PBM75668_pass_L001_barcode01.fastq
-```
 
 Per input, the script runs exactly this — the command from
 [`COMMAND_EXPLAINED.md`](COMMAND_EXPLAINED.md), plus the three things that
@@ -472,6 +325,7 @@ minimap2 -ax splice --secondary=no -t 8 \
 samtools index -@ 4 big_data/outputs/PBM75668_pass_L001_barcode01.bam
 samtools flagstat big_data/outputs/PBM75668_pass_L001_barcode01.bam
 ```
+
 
 The additions are the `.bai` index (nexons queries by region and needs it), an
 explicit `-T` sort scratch directory, and `-@`/`-m` instead of samtools' rather
@@ -498,24 +352,27 @@ is deliberate on a 16-core box: it leaves cores for the concurrent sort.
 `-t16` has both programs contending for every core and typically runs *slower*
 end to end.
 
-### Timing
 
-No measured figure exists for this environment — minimap2 has never
-successfully run here. For an estimate on your own hardware, use the archived
-script's benchmark mode, which aligns *n* reads and extrapolates:
 
-```bash
-BENCHMARK=200000 pixi run ./fastq_to_bam/fastq_to_bam.sh.old
-```
 
-For scale: barcode01 is 3,442,720 reads / 4.17 Gbase, mean read length
-1,211 bp, and its uncompressed FASTQ carries roughly 466 Mbase per GiB. Note
-that transfer and alignment overlap — finished barcodes can be aligned while
-the rest are still arriving.
+
+
+
 
 ---
 
-## Step 8 (RECOMMENDED) — check the outputs
+
+
+
+
+
+
+
+
+
+## Step 9
+
+check the outputs (TODO)
 
 ```bash
 cd sandbox/big_data/outputs
@@ -539,7 +396,9 @@ against, so record it.
 
 ---
 
-## Step 9 (RECOMMENDED) — hand it to nexons
+## Step 10
+
+hand it to nexons
 
 ```bash
 cd /path/to/nexons
@@ -556,6 +415,7 @@ GTF you verified in Step 4 — and if you took the Step 5b subset path, the
 *subset* GTF.
 
 ---
+
 
 ## Troubleshooting
 
