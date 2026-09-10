@@ -1,0 +1,62 @@
+"""CLI integration coverage for concurrent BAM files and ordered aggregation."""
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import pysam
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'nexons.py'
+
+
+class ParallelFilesTests(unittest.TestCase):
+    def test_serial_and_parallel_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gtf = root / 'genes.gtf'
+            gtf.write_text('chr1\tx\texon\t101\t200\t.\t+\t.\tgene_id "g"; transcript_id "t"; transcript_support_level "1";\n')
+            inputs = []
+            for name, count in [('z', 7), ('a', 3)]:
+                path = root / f'{name}.bam'
+                inputs.append(str(path))
+                with pysam.AlignmentFile(path, 'wb', header={
+                    'HD': {'VN': '1.6', 'SO': 'coordinate'},
+                    'SQ': [{'SN': 'chr1', 'LN': 1000}]}) as bam:
+                    for i in range(count):
+                        read = pysam.AlignedSegment(bam.header)
+                        read.query_name = f'{name}_{i}'
+                        read.reference_id = 0
+                        read.reference_start = 100
+                        read.cigarstring = '100M'
+                        read.query_sequence = 'A' * 100
+                        bam.write(read)
+            for jobs in (1, 2):
+                result = subprocess.run([sys.executable, str(SCRIPT), str(gtf),
+                    *inputs, '--parallel', str(jobs), '--outbase', str(root / f'out{jobs}')],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            for category in ('unique', 'partial', 'gene'):
+                serial = (root / f'out1_{category}.txt').read_text()
+                self.assertEqual(serial, (root / f'out2_{category}.txt').read_text())
+                self.assertEqual(serial.splitlines()[0].split('\t')[-2:], inputs)
+                self.assertEqual(serial.splitlines()[1].split('\t')[-2:], ['7', '3'])
+            for name in ('z', 'a'):
+                self.assertEqual((root / f'out1_{name}_stats.txt').read_text(),
+                                 (root / f'out2_{name}_stats.txt').read_text())
+                self.assertTrue((root / f'out2_{name}_qc.html').exists())
+                with pysam.AlignmentFile(root / f'out1_{name}.bam', 'rb') as a, \
+                     pysam.AlignmentFile(root / f'out2_{name}.bam', 'rb') as b:
+                    self.assertEqual([r.to_string() for r in a], [r.to_string() for r in b])
+
+    def test_invalid_parallel(self):
+        for args in (['--parallel', '0', 'x.gtf', 'a.bam'],
+                     ['--parallel', '2', 'x.gtf', 'one/a.bam', 'two/a.bam']):
+            result = subprocess.run([sys.executable, str(SCRIPT), *args],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('--parallel', result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

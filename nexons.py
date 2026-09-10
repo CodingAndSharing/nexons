@@ -6,6 +6,9 @@ from pathlib import Path
 import json
 import html
 import math
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 
 VERSION = "0.3.devel"
 
@@ -34,21 +37,41 @@ def main():
 
     results = []
 
-    # Process each of the BAM files and add their data to the quantitations
-    for count,bam_file in enumerate(options.bam):
-        log(f"Quantitating {bam_file} ({count+1} of {len(options.bam)})")
-        read_lengths,outcomes,quantitations,endflex_observations,innerflex_observations,coverage = process_bam_file(genes_transcripts_exons, gene_index, bam_file, options.direction, options.flex, options.endflex)
+    # Ordered results keep the aggregated columns aligned with the input BAMs.
+    with ExitStack() as stack:
+        initialise_file_worker(genes_transcripts_exons, gene_index, options)
+        if options.parallel > 1 and len(options.bam) > 1:
+            pool = stack.enter_context(ProcessPoolExecutor(
+                max_workers=min(options.parallel, len(options.bam)),
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=initialise_file_worker,
+                initargs=(genes_transcripts_exons, gene_index, options)))
+            file_results = pool.map(process_file_job, enumerate(options.bam))
+        else:
+            file_results = map(process_file_job, enumerate(options.bam))
 
-        results.append(quantitations)
-
-        write_stats_file(bam_file,outcomes, read_lengths,endflex_observations, innerflex_observations, coverage, options.outbase)
-        write_qc_report(bam_file,outcomes, read_lengths,endflex_observations, innerflex_observations, coverage, options, options.outbase)
-
-        # log(f"Summary for {bam_file}:")
-        # for metric in outcomes:
-        #     log(f"{metric}: {outcomes[metric]}")
+        for bam_file, result in zip(options.bam, file_results):
+            read_lengths,outcomes,quantitations,endflex_observations,innerflex_observations,coverage = result
+            results.append(quantitations)
+            write_stats_file(bam_file,outcomes, read_lengths,endflex_observations, innerflex_observations, coverage, options.outbase)
+            write_qc_report(bam_file,outcomes, read_lengths,endflex_observations, innerflex_observations, coverage, options, options.outbase)
 
     write_output(genes_transcripts_exons,results,options.bam,options.outbase)
+
+def initialise_file_worker(genes, index, worker_options):
+    """Install read-only annotation data and CLI options once per process."""
+    global file_worker_genes, file_worker_index, options
+    file_worker_genes = genes
+    file_worker_index = index
+    options = worker_options
+
+
+def process_file_job(job):
+    count, bam_file = job
+    log(f"Quantitating {bam_file} ({count+1} of {len(options.bam)})")
+    return process_bam_file(file_worker_genes, file_worker_index, bam_file,
+                            options.direction, options.flex, options.endflex)
+
 
 def write_stats_file(bam_file, outcomes, read_lengths, endflex, innerflex, coverage, outbase):
     outfile = outbase+"_"+(Path(bam_file).name[:-4])+"_stats.txt"
@@ -323,7 +346,7 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         end_flex_observations[i] = 0
 
 
-    samfile = pysam.AlignmentFile(bam_file, "rb")
+    samfile = pysam.AlignmentFile(bam_file, "rb", threads=2)
 
     # We may want to write out an annotated version of the BAM file where we
     # add tags to indicate the decision we made about this read
@@ -333,7 +356,7 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
     if not options.noannotate:
         outbam = Path(bam_file)
         outbam = (options.outbase + "_" + outbam.name)
-        outsam = pysam.AlignmentFile(outbam,"wb", template=samfile)
+        outsam = pysam.AlignmentFile(outbam,"wb", template=samfile, threads=2)
 
 
     for read in samfile.fetch(until_eof=True):
@@ -1182,6 +1205,11 @@ def get_options():
     )
 
     parser.add_argument(
+        "--parallel", type=int, default=1,
+        help="Number of BAM files to process concurrently (default 1)",
+    )
+
+    parser.add_argument(
         "--maxtsl",
         help="Maximum transcript support level to analyse (default 2)",
         type=int,
@@ -1252,6 +1280,14 @@ def get_options():
     )
 
     options = parser.parse_args()
+
+    if options.parallel < 1:
+        parser.error("--parallel must be at least 1")
+    if options.parallel > 1:
+        # Per-file outputs use basenames, so concurrent jobs must not share one.
+        names = [Path(bam).name for bam in options.bam]
+        if len(names) != len(set(names)):
+            parser.error("--parallel requires BAM files with distinct basenames")
 
     if options.maxtsl == 0:
         options.maxtsl = None
