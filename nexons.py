@@ -1013,6 +1013,10 @@ def get_exons(read):
 def read_gtf(gtf_file, max_tsl):
     debug(f"Reading GTF {gtf_file} with max_tsl {max_tsl}")
 
+    good_tags = ("MANE_Select", "Ensembl_Canonical", "gencode_primary", "gencode_basic")
+    attribute_prefixes = ("gene_id", "gene_name", "transcript_id",
+                          "transcript_name", "transcript_support_level")
+
     with open(gtf_file) as file:
 
         genes = {}
@@ -1048,20 +1052,23 @@ def read_gtf(gtf_file, max_tsl):
             transcript_support_level=None
 
             for comment in comments:
-                if comment.strip().startswith("gene_id"):
+                stripped = comment.strip()
+                if not stripped.startswith(attribute_prefixes):
+                    continue
+                if stripped.startswith("gene_id"):
                     gene_id=comment[8:].replace('"','').strip()
                 
-                if comment.strip().startswith("gene_name"):
-                    gene_name=comment.strip()[10:].replace('"','').strip()
+                elif stripped.startswith("gene_name"):
+                    gene_name=stripped[10:].replace('"','').strip()
                     
-                if comment.strip().startswith("transcript_id"):
+                elif stripped.startswith("transcript_id"):
                     transcript_id=comment[15:].replace('"','').strip()
                           
-                if comment.strip().startswith("transcript_name"):
-                    transcript_name=comment.strip()[17:].replace('"','').strip()
+                elif stripped.startswith("transcript_name"):
+                    transcript_name=stripped[17:].replace('"','').strip()
 
-                if comment.strip().startswith("transcript_support_level"):
-                    temp_tsl=comment.strip()[24:].replace('"','').strip().split()[0].strip()
+                elif stripped.startswith("transcript_support_level"):
+                    temp_tsl=stripped[24:].replace('"','').strip().split()[0].strip()
                     if not temp_tsl.isdigit():
                         if temp_tsl=="NA":
                             continue
@@ -1072,7 +1079,6 @@ def read_gtf(gtf_file, max_tsl):
             # We have a lot of primary transcripts with no annotated TSL so we're going to 
             # force the issue in these cases.  Even where there is a TSL we're overwriting
             # to keep these genes
-            good_tags = ["MANE_Select","Ensembl_Canonical","gencode_primary","gencode_basic"]
             for good_tag in good_tags:
                 if good_tag in sections[8]:
                     transcript_support_level = 1
@@ -1110,8 +1116,9 @@ def read_gtf(gtf_file, max_tsl):
             exon = [start, end]
             
 
-            if gene_id not in genes:
-                genes[gene_id] = {
+            gene = genes.get(gene_id)
+            if gene is None:
+                gene = genes[gene_id] = {
                     "name": gene_name,
                     "id": gene_id,
                     "chrom": chrom,
@@ -1122,14 +1129,16 @@ def read_gtf(gtf_file, max_tsl):
                     }
                 }
             else:
-                if start < genes[gene_id]["start"]:
-                    genes[gene_id]["start"] = start
-                if end > genes[gene_id]["end"]:
-                    genes[gene_id]["end"] = end
+                if start < gene["start"]:
+                    gene["start"] = start
+                if end > gene["end"]:
+                    gene["end"] = end
 
 
-            if transcript_id not in genes[gene_id]["transcripts"]:
-                genes[gene_id]["transcripts"][transcript_id] = {
+            transcripts = gene["transcripts"]
+            transcript = transcripts.get(transcript_id)
+            if transcript is None:
+                transcript = transcripts[transcript_id] = {
                     "name": transcript_name,
                     "id": transcript_id,
                     "chrom": chrom,
@@ -1139,14 +1148,14 @@ def read_gtf(gtf_file, max_tsl):
                     "exons" : []
                 }
             else:
-                if start < genes[gene_id]["transcripts"][transcript_id]["start"]:
-                    genes[gene_id]["transcripts"][transcript_id]["start"] = start
+                if start < transcript["start"]:
+                    transcript["start"] = start
 
-                if end > genes[gene_id]["transcripts"][transcript_id]["end"]:
-                    genes[gene_id]["transcripts"][transcript_id]["end"] = end
+                if end > transcript["end"]:
+                    transcript["end"] = end
 
 
-            genes[gene_id]["transcripts"][transcript_id]["exons"].append(exon)
+            transcript["exons"].append(exon)
 
 
     # Before returning the results we need to put the exons
