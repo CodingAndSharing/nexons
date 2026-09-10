@@ -325,6 +325,17 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
 
     samfile = pysam.AlignmentFile(bam_file, "rb")
 
+    # We may want to write out an annotated version of the BAM file where we
+    # add tags to indicate the decision we made about this read
+
+    outsam = None
+
+    if not options.noannotate:
+        outbam = Path(bam_file)
+        outbam = (options.outbase + "_" + outbam.name)
+        outsam = pysam.AlignmentFile(outbam,"wb", template=samfile)
+
+
     for read in samfile.fetch(until_eof=True):
 
         outcomes["Total_Reads"] += 1
@@ -332,11 +343,16 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         if read.is_unmapped:
             # Nothing to see here
             outcomes["No_Alignment"] += 1
+            if outsam is not None:
+                outsam.write(read)
             continue
 
         if read.is_secondary:
             # This isn't the primary alignment
             outcomes["Secondary_Alignment"] += 1
+
+            if outsam is not None:
+                outsam.write(read)
             continue
 
         outcomes["Primary_Alignment"] += 1
@@ -349,8 +365,11 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         read_lengths[length_bin][1] += 1
 
         if not read.reference_name in index:
-            # There are no features on this chromsome
+            # There are no features on this chromosome
             outcomes["No_Gene"] += 1
+
+            if outsam is not None:
+                outsam.write(read)
             continue
 
 
@@ -383,6 +402,8 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
 
         if not possible_genes:
             outcomes["No_Gene"] += 1
+            if outsam is not None:
+                outsam.write(read)
             continue
 
         found_hit = False
@@ -475,6 +496,8 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
         # Now we can increase the appropriate counts
         if not found_hit and found_status is None:
             outcomes["No_Hit"] += 1
+            if outsam is not None:
+                outsam.write(read)
 
         elif not found_hit and status == "intron":
             # We have only a gene level hit
@@ -483,10 +506,19 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
                 counts["gene"][found_gene_id] = 1
             else:
                 counts["gene"][found_gene_id] += 1
+            if outsam is not None:
+                # Add gene id tag and gene level id
+                read.set_tag("nG",found_gene_id,value_type="Z")
+                read.set_tag("nR","gene",value_type="Z")
+                outsam.write(read)
 
 
         elif found_status == "multi":
             outcomes["Multi_Gene"] += 1
+            if outsam is not None:
+                # Add multi gene tag
+                read.set_tag("nR","gene",value_type="Z")
+                outsam.write(read)
 
         else:
             # There is a hit
@@ -513,6 +545,10 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
                     # print("Rev Matching from",used_start_percentile," to ",used_end_percentile)
                     for i in range(used_start_percentile,used_end_percentile+1):
                         read_coverage_percentiles[i] += 1
+            elif found_status == "gene" or found_status == "intron":
+                # Add tag for gene and trascript and partial status
+                read.set_tag("nG",found_gene_id,value_type="Z")
+                read.set_tag("nR","gene",value_type="Z")
 
             # We can add in the flex values to the total
             for i in best_endflex:
@@ -531,6 +567,13 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
             if found_status == "partial" or found_status == "unique":
                 # We increment the partial counts
                 outcomes["Partial"] += 1
+                if outsam is not None and found_status == "partial":
+                    # Add tag for gene and trascript and partial status
+                    read.set_tag("nG",found_gene_id,value_type="Z")
+                    read.set_tag("nT",found_transcript_id,value_type="Z")
+                    read.set_tag("nR","partial",value_type="Z")
+
+                    outsam.write(read)
 
                 if not (found_gene_id,found_transcript_id) in counts["partial"]:
                     counts["partial"][(found_gene_id,found_transcript_id)] = 1
@@ -541,6 +584,13 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
             if found_status == "unique":
                 # We increase the unique count
                 outcomes["Unique"] += 1
+
+                if outsam is not None:
+                    # Add tag for gene and trascript and unique status
+                    read.set_tag("nG",found_gene_id,value_type="Z")
+                    read.set_tag("nT",found_transcript_id,value_type="Z")
+                    read.set_tag("nR","unique",value_type="Z")
+                    outsam.write(read)
 
                 if not (found_gene_id,found_transcript_id) in counts["unique"]:
                     counts["unique"][(found_gene_id,found_transcript_id)] = 1
@@ -1158,6 +1208,12 @@ def get_options():
         "--direction","-d",
         help="The directionality of the library (none, same, opposing)",
         default="none"
+    )
+
+    parser.add_argument(
+        "--noannotate",
+        action="store_true",
+        help="Skip the annotation of the BAM files"
     )
 
     parser.add_argument(
