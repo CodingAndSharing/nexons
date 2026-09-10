@@ -549,6 +549,7 @@ def process_bam_file(genes, index, bam_file, direction, flex, endflex):
                 # Add tag for gene and trascript and partial status
                 read.set_tag("nG",found_gene_id,value_type="Z")
                 read.set_tag("nR","gene",value_type="Z")
+                outsam.write(read)
 
             # We can add in the flex values to the total
             for i in best_endflex:
