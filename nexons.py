@@ -10,7 +10,7 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 
-VERSION = "0.3.devel"
+VERSION = "2026.09.01_devel"
 
 # This is the resolution of the feature indexing - we split the genome
 # into bins of this size and use these to quickly find the features we
@@ -1224,34 +1224,34 @@ def get_options():
 
     parser.add_argument(
         "--outbase","-o",
-        help="The basename for the output count tables. All outputs will start with this prefix",
+        help="The basename for the output count tables. All outputs will start with this prefix (default ./nexons_output)",
         default="./nexons_output"
     )
 
     parser.add_argument(
         "--flex","-f",
-        help="How many bases different can exon boundaries be and still merge them",
+        help="How many bases different can exon boundaries be and still merge them (default 10)",
         default=10, 
         type=int
     )
 
     parser.add_argument(
         "--endflex","-e",
-        help="How many bases different can transcript ends be and still merge them",
+        help="How many bases different can transcript ends be and still merge them (default 500)",
         default=500, 
         type=int
     )
 
     parser.add_argument(
         "--direction","-d",
-        help="The directionality of the library (none, same, opposing)",
+        help="The directionality of the library [none, same, opposing] (default none)",
         default="none"
     )
 
     parser.add_argument(
         "--noannotate",
         action="store_true",
-        help="Skip the annotation of the BAM files"
+        help="Skip the production of annotated BAM files"
     )
 
     parser.add_argument(
